@@ -1,14 +1,16 @@
-# systemd *user* unit: the AirPlay output configured in
-# ~/.config/airpipe/config.toml (output.speakers).
+# systemd *user* unit: airpipe in the background. It creates the "AirPlay"
+# output and plays to the speakers chosen with `airpipe use <speaker>`.
 #
 #   systemctl --user enable --now airpipe.service
 #
-# For a one-speaker setup without editing config.toml, use
-# airpipe@<speaker>.service instead. Enable only one of them: a single airpipe
-# runs at a time.
+# Then `airpipe status`, `airpipe use ...`, `airpipe stop` talk to it.
+#
+# Packages install this file to /usr/lib/systemd/user/. With `cargo install`,
+# copy it to ~/.config/systemd/user/ and change ExecStart to
+# %h/.cargo/bin/airpipe run.
 
 [Unit]
-Description=AirPlay output (speakers from ~/.config/airpipe/config.toml)
+Description=AirPlay output (airpipe)
 After=pipewire.service wireplumber.service
 Wants=pipewire.service
 
@@ -17,6 +19,9 @@ Wants=pipewire.service
 ExecStart=airpipe run
 Restart=on-failure
 RestartSec=5
+# 3 = another airpipe is already running (e.g. `airpipe run` in a terminal):
+# retrying would not help.
+RestartPreventExitStatus=3
 # Use airpipe=debug when troubleshooting (journalctl --user -u airpipe).
 Environment=RUST_LOG=airpipe=info
 

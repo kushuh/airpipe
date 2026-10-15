@@ -12,6 +12,11 @@
 //! * The AirPlay latency is reported as `ProcessLatency`, so players that do
 //!   A/V sync (video players, browsers) delay video accordingly.
 //!
+//! * The output is renamed when the speakers change, and on quit the
+//!   previous default output is given back (`default_output.rs`) before the
+//!   output disappears: `Quit` waits for PipeWire to confirm, `ForceQuit`
+//!   (sent after 1 s) stops regardless.
+//!
 //! Everything PipeWire runs on a dedicated thread; samples cross to the audio
 //! engine through a lock-free ring buffer, and control events through a
 //! tokio channel.
@@ -33,7 +38,12 @@ pub use crate::group::volume::SystemVolume;
 enum ToSink {
     /// Set the output's volume, as a slider position (0.0..=1.0).
     SetLevel(f32),
+    /// Rename the output (shown in desktop sound settings).
+    SetDescription(String),
+    /// Hand the default output back, then stop.
     Quit,
+    /// Stop now (sent if PipeWire does not confirm `Quit` in time).
+    ForceQuit,
 }
 
 pub struct Sink {
@@ -87,11 +97,22 @@ impl Sink {
     pub fn set_level(&self, level: f32) {
         let _ = self.tx.send(ToSink::SetLevel(level.clamp(0.0, 1.0)));
     }
+
+    /// Renames the output, e.g. when the speakers change.
+    pub fn set_description(&self, description: &str) {
+        let _ = self.tx.send(ToSink::SetDescription(description.to_string()));
+    }
 }
 
 impl Drop for Sink {
     fn drop(&mut self) {
         let _ = self.tx.send(ToSink::Quit);
+        // Never hang on exit if PipeWire does not answer.
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let _ = tx.send(ToSink::ForceQuit);
+        });
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -209,6 +230,22 @@ fn run(
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
+    let default_output = crate::default_output::DefaultOutput::watch(&core, &cfg.node_name)?;
+    // Quitting waits for PipeWire to confirm the default-output change (if
+    // any) so it is applied before our output disappears.
+    let quit_after = std::rc::Rc::new(std::cell::Cell::new(None));
+    let _core_listener = core
+        .add_listener_local()
+        .done({
+            let mainloop = mainloop.clone();
+            let quit_after = quit_after.clone();
+            move |id, seq| {
+                if id == pw::core::PW_ID_CORE && quit_after.get() == Some(seq) {
+                    mainloop.quit();
+                }
+            }
+        })
+        .register();
 
     let props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -281,6 +318,7 @@ fn run(
     let _rx = rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let stream = stream.clone();
+        let core = core.clone();
         let forward_volume = cfg.forward_volume;
         move |msg| match msg {
             ToSink::SetLevel(level) => {
@@ -295,7 +333,24 @@ fn run(
                     warn!("could not set output volume: {e}");
                 }
             }
-            ToSink::Quit => mainloop.quit(),
+            ToSink::SetDescription(description) => {
+                let props = pw::properties::properties! { *pw::keys::NODE_DESCRIPTION => description.as_str() };
+                // SAFETY: both pointers are valid for the call, which copies the dict.
+                let res = unsafe { pw::sys::pw_stream_update_properties(stream.as_raw_ptr(), &props.as_raw().dict) };
+                if res < 0 {
+                    warn!("could not rename the output ({res})");
+                }
+            }
+            ToSink::Quit => {
+                if default_output.restore()
+                    && let Ok(seq) = core.sync(0)
+                {
+                    quit_after.set(Some(seq)); // quit once PipeWire confirms
+                } else {
+                    mainloop.quit();
+                }
+            }
+            ToSink::ForceQuit => mainloop.quit(),
         }
     });
 

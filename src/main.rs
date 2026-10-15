@@ -1,26 +1,29 @@
-use std::io::{IsTerminal, Write};
+use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 use airpipe::airplay::connection::{Connection, USER_AGENT};
 use airpipe::airplay::session::SessionEvent;
 use airpipe::config::{self, Config, LatencyProfile};
+use airpipe::control::{self, Reply, Request};
 use airpipe::discovery::{self, Device, feature};
 use airpipe::group::volume::{self, VolumeInputs};
-use airpipe::group::{self, ConsoleCommand, GroupConfig, Pipeline};
+use airpipe::group::{self, GroupConfig, Pipeline};
 use airpipe::proto::rtp::SAMPLE_RATE;
-use airpipe::proto::rtsp::Request;
+use airpipe::proto::rtsp;
 use airpipe::store::{DeviceSettings, Store};
 
 #[derive(Parser)]
 #[command(
     version,
     about = "Stream Linux system audio from PipeWire to AirPlay 2 speakers (sender only)",
-    after_help = "Settings: ~/.config/airpipe/config.toml (global) and devices.toml (per speaker). \
+    after_help = "airpipe runs in the background (`systemctl --user enable --now airpipe.service`, or \
+                  `airpipe run` in a terminal); status, use, add, remove, gain, reload and stop talk to it.\n\
+                  Settings: ~/.config/airpipe/config.toml (global) and devices.toml (per speaker). \
                   Run `airpipe config` to see paths and effective values."
 )]
 struct Cli {
@@ -44,12 +47,34 @@ enum Cmd {
     },
     /// Forget a speaker's pairing keys (its settings are kept).
     Unpair { speaker: String },
-    /// Create a PipeWire output that plays on the given speakers, in sync.
-    /// Only one `airpipe run` can be active at a time.
-    Run {
-        /// Speaker names as shown by `airpipe list`. Defaults to
-        /// `output.speakers` in config.toml.
+    /// Choose the speakers to play to (saved in config.toml). Several
+    /// speakers play in sync.
+    Use {
+        #[arg(required = true)]
         speakers: Vec<String>,
+    },
+    /// Add a speaker to the ones in use.
+    Add { speaker: String },
+    /// Stop using a speaker.
+    Remove { speaker: String },
+    /// Show the speakers in use, their state and volume.
+    Status,
+    /// Make one speaker of a group quieter, in dB (e.g. -6), until airpipe
+    /// restarts. To keep it, lower its default_volume or max_volume in
+    /// devices.toml.
+    Gain {
+        speaker: String,
+        #[arg(allow_hyphen_values = true)]
+        db: f32,
+    },
+    /// Apply changes made by hand to config.toml (speakers) and devices.toml.
+    Reload,
+    /// Stop the running airpipe (sound goes back to your previous output).
+    Stop,
+    /// Run airpipe: create the "AirPlay" output and play to the speakers in
+    /// config.toml. Usually run by systemd (`airpipe.service`); only one
+    /// runs at a time.
+    Run {
         /// Buffering preset (overrides config.toml).
         #[arg(long, value_enum)]
         latency: Option<LatencyProfile>,
@@ -65,9 +90,9 @@ enum Cmd {
         /// Do not send now-playing metadata or accept speaker remote control.
         #[arg(long)]
         no_metadata: bool,
-        /// Extra volume ceiling in AirPlay dB for this run, on top of each
-        /// speaker's max_volume_db (-30 quietest .. 0 = speaker maximum).
-        #[arg(long, allow_hyphen_values = true, value_parser = parse_volume)]
+        /// Never play louder than this percentage of a speaker's full power,
+        /// on top of each speaker's max_volume (devices.toml).
+        #[arg(long, value_parser = parse_percent)]
         max_volume: Option<f32>,
     },
     /// Play a quiet test tone on a speaker (diagnostics; no PipeWire involved).
@@ -75,9 +100,9 @@ enum Cmd {
         speaker: String,
         #[arg(long, default_value_t = 5)]
         seconds: u64,
-        /// AirPlay volume in dB, -30 (quietest) to 0 (speaker maximum).
-        /// Capped by the speaker's max_volume_db.
-        #[arg(long, default_value_t = -28.0, allow_hyphen_values = true, value_parser = parse_volume)]
+        /// Volume in percent of the speaker's full power. Capped by the
+        /// speaker's max_volume (devices.toml).
+        #[arg(long, default_value = "5", value_parser = parse_percent)]
         volume: f32,
     },
     /// Show where settings live and the effective configuration.
@@ -88,6 +113,17 @@ enum Cmd {
 // D-Bus I/O. Real-time audio and PipeWire run on their own threads.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    let result = run_command().await;
+    if let Err(e) = &result
+        && e.is::<control::AlreadyRunning>()
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(control::ALREADY_RUNNING);
+    }
+    result
+}
+
+async fn run_command() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -107,7 +143,31 @@ async fn main() -> Result<()> {
         Cmd::Pair { speaker, password } => pair(&speaker, password, &store).await,
         Cmd::Unpair { speaker } => unpair(&speaker, &store).await,
         Cmd::Config => show_config(&config_path, &store),
-        Cmd::Run { speakers, latency, latency_ms, idle_timeout, node_name, no_metadata, max_volume } => {
+        Cmd::Use { speakers } => set_speakers(&config_path, speakers).await,
+        Cmd::Add { speaker } => {
+            let mut speakers = Config::load(&config_path)?.output.speakers;
+            if speakers.iter().any(|s| s.eq_ignore_ascii_case(&speaker)) {
+                bail!("{speaker} is already in use");
+            }
+            speakers.push(speaker);
+            set_speakers(&config_path, speakers).await
+        }
+        Cmd::Remove { speaker } => {
+            let mut speakers = Config::load(&config_path)?.output.speakers;
+            let before = speakers.len();
+            speakers.retain(|s| !s.eq_ignore_ascii_case(&speaker));
+            if speakers.len() == before {
+                bail!("{speaker} is not in use (see `airpipe status`)");
+            }
+            set_speakers(&config_path, speakers).await
+        }
+        Cmd::Status => request(Request::Status).await,
+        Cmd::Gain { speaker, db } => request(Request::Gain { speaker: checked_name(speaker)?, db }).await,
+        Cmd::Reload => request(Request::Reload).await,
+        Cmd::Stop => request(Request::Stop).await,
+        Cmd::Run { latency, latency_ms, idle_timeout, node_name, no_metadata, max_volume } => {
+            // First, so a second airpipe stops here before touching anything.
+            let control = control::Server::bind()?;
             let mut cfg = Config::load_or_create(&config_path)?;
             // Command-line flags override config.toml.
             if let Some(p) = latency {
@@ -126,19 +186,8 @@ async fn main() -> Result<()> {
             if no_metadata {
                 cfg.metadata.enabled = false;
             }
-            let speakers = if speakers.is_empty() { cfg.output.speakers.clone() } else { speakers };
-            if speakers.is_empty() {
-                bail!(
-                    "no speakers given: pass names (see `airpipe list`) or set output.speakers in {}",
-                    config_path.display()
-                );
-            }
-            let group_cfg = GroupConfig { config: cfg, speakers, volume_cap_db: max_volume };
-            let (tx, rx) = mpsc::unbounded_channel();
-            if std::io::stdin().is_terminal() {
-                tokio::spawn(console(tx));
-            }
-            group::run(group_cfg, store, rx).await
+            let group_cfg = GroupConfig { config: cfg, config_path, volume_cap: max_volume };
+            group::run(group_cfg, store, control).await
         }
         Cmd::Tone { speaker, seconds, volume } => {
             let cfg = Config::load(&config_path)?;
@@ -155,24 +204,62 @@ fn parse_latency_ms(s: &str) -> Result<u32, String> {
     }
 }
 
-fn parse_volume(s: &str) -> Result<f32, String> {
-    let v: f32 = s.parse().map_err(|_| format!("{s:?} is not a number"))?;
-    if (volume::MIN_DB..=0.0).contains(&v) {
-        Ok(v)
-    } else {
-        Err("must be between -30 (quietest) and 0 (speaker maximum) dB".into())
+/// A percentage of a speaker's range, as a slider position (0.0..=1.0).
+fn parse_percent(s: &str) -> Result<f32, String> {
+    match s.trim_end_matches('%').parse::<f32>() {
+        Ok(v) if (0.0..=100.0).contains(&v) => Ok(v / 100.0),
+        _ => Err("must be a percentage from 0 to 100".into()),
+    }
+}
+
+/// Speaker names travel in the control protocol's tab-separated lines.
+fn checked_name(name: String) -> Result<String> {
+    if name.trim().is_empty() || name.chars().any(char::is_control) {
+        bail!("{name:?} is not a valid speaker name (see `airpipe list`)");
+    }
+    Ok(name)
+}
+
+/// Sends a request to the running airpipe and prints its answer.
+async fn request(request: Request) -> Result<()> {
+    print_reply(control::send(&request).await?)
+}
+
+fn print_reply(reply: Reply) -> Result<()> {
+    if !reply.ok {
+        bail!("{}", reply.text);
+    }
+    if !reply.text.is_empty() {
+        println!("{}", reply.text);
+    }
+    Ok(())
+}
+
+/// Saves the speaker list, then has the running airpipe switch to it.
+async fn set_speakers(config_path: &Path, speakers: Vec<String>) -> Result<()> {
+    let speakers = speakers.into_iter().map(checked_name).collect::<Result<Vec<_>>>()?;
+    config::save_speakers(config_path, &speakers)?;
+    let list = if speakers.is_empty() { "none".to_string() } else { speakers.join(", ") };
+    println!("Speakers: {list} (saved in {})", config_path.display());
+    match control::send(&Request::Reload).await {
+        Ok(reply) => print_reply(reply),
+        Err(e) if e.is::<control::NotRunning>() => {
+            println!("airpipe is not running; it plays to them once started. {}", control::HOW_TO_START);
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }
 
 /// Read-only: shows settings without creating any file.
-fn show_config(path: &std::path::Path, store: &Store) -> Result<()> {
+fn show_config(path: &Path, store: &Store) -> Result<()> {
     let cfg = Config::load(path)?;
-    let exists = |p: &std::path::Path| if p.exists() { "" } else { " (not created yet)" };
+    let exists = |p: &Path| if p.exists() { "" } else { " (not created yet)" };
     println!("Global settings: {}{}", path.display(), exists(path));
     println!("Device memory:   {}{}", store.path().display(), exists(&store.path()));
     println!();
     let speakers = if cfg.output.speakers.is_empty() {
-        "(none: pass names to `airpipe run`)".to_string()
+        "(none: choose with `airpipe use <speaker>`)".to_string()
     } else {
         cfg.output.speakers.join(", ")
     };
@@ -225,7 +312,7 @@ async fn find(name: &str) -> Result<Device> {
 async fn info(name: &str) -> Result<()> {
     let device = find(name).await?;
     let mut conn = Connection::connect(device.address, vec![("User-Agent".into(), USER_AGENT.into())]).await?;
-    let resp = conn.request_ok(Request::new("GET", "/info")).await?;
+    let resp = conn.request_ok(rtsp::Request::new("GET", "/info")).await?;
     let value = airpipe::proto::plist::parse(&resp.body).context("parsing /info")?;
     println!("{} ({})", device.name, device.address);
     println!("  model:    {} {} (firmware {})", device.manufacturer, device.model, device.firmware);
@@ -274,53 +361,17 @@ async fn unpair(name: &str, store: &Store) -> Result<()> {
     Ok(())
 }
 
-const CONSOLE_HELP: &str = "commands: status | gain <speaker> <dB> | reload | add <speaker> | remove <speaker> | quit";
-
-/// Reads console commands from stdin while `run` is active.
-async fn console(tx: mpsc::UnboundedSender<ConsoleCommand>) {
-    println!("Console: {CONSOLE_HELP}");
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let cmd = match words.as_slice() {
-            [] => continue,
-            ["status" | "s"] => ConsoleCommand::Status,
-            ["reload" | "r"] => ConsoleCommand::Reload,
-            ["quit" | "q" | "exit"] => ConsoleCommand::Quit,
-            ["gain", rest @ ..] if rest.len() >= 2 => match rest[rest.len() - 1].parse::<f32>() {
-                Ok(db) => ConsoleCommand::Gain { speaker: rest[..rest.len() - 1].join(" "), db },
-                Err(_) => {
-                    println!("usage: gain <speaker> <dB, e.g. -6>");
-                    continue;
-                }
-            },
-            ["add", rest @ ..] if !rest.is_empty() => ConsoleCommand::Add(rest.join(" ")),
-            ["remove" | "rm", rest @ ..] if !rest.is_empty() => ConsoleCommand::Remove(rest.join(" ")),
-            _ => {
-                println!("{CONSOLE_HELP}");
-                continue;
-            }
-        };
-        let quit = matches!(cmd, ConsoleCommand::Quit);
-        if tx.send(cmd).is_err() || quit {
-            return;
-        }
-    }
-    // stdin closed (Ctrl-D): treat as quit.
-    let _ = tx.send(ConsoleCommand::Quit);
-}
-
 async fn tone(name: &str, seconds: u64, volume: f32, cfg: &Config, store: Store) -> Result<()> {
     let device = find(name).await?;
     let settings = store.device_settings(&device)?;
-    // Same rules as streaming: never above the speaker's max_volume_db.
-    let volume = VolumeInputs {
-        settings: DeviceSettings { default_volume_db: volume, ..settings },
+    // Same rules as streaming: never above the speaker's max_volume.
+    let inputs = VolumeInputs {
+        settings: DeviceSettings { default_volume: volume, ..settings },
         gain_db: 0.0,
-        cap_db: None,
+        cap: None,
         follow_system: false,
-    }
-    .airplay_db(None);
+    };
+    let volume = inputs.airplay_db(None);
 
     // Same pipeline as `airpipe run`, fed by a tone generator instead of PipeWire.
     let (mut producer, consumer) = rtrb::RingBuffer::<i16>::new(SAMPLE_RATE as usize * 2);
@@ -356,7 +407,10 @@ async fn tone(name: &str, seconds: u64, volume: f32, cfg: &Config, store: Store)
     let target = pipeline.engine.add_target(ip, session.ports.data, session.ports.control, 0)?;
     // The first sound comes out after the configured latency.
     let latency = Duration::from_millis(latency_ms.into());
-    println!("Playing a 440 Hz tone at {volume:.1} dB for {seconds}s (after {latency_ms} ms of buffering)...");
+    println!(
+        "Playing a 440 Hz tone at {:.0}% ({volume:.1} dB) for {seconds}s (after {latency_ms} ms of buffering)...",
+        volume::db_to_level(volume) * 100.0
+    );
     let end = tokio::time::sleep(latency + Duration::from_secs(seconds));
     tokio::pin!(end);
     loop {

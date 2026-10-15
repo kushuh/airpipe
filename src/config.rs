@@ -1,9 +1,11 @@
 //! Global settings: `$XDG_CONFIG_HOME/airpipe/config.toml`.
 //!
-//! The file is written once, as a commented template, the first time airpipe
-//! runs, and never modified by airpipe afterwards: it belongs to the user.
-//! Every key is optional; missing keys take the defaults below. Unknown keys
-//! are rejected so that typos do not silently do nothing.
+//! The file is written as a commented template the first time airpipe runs.
+//! It belongs to the user: airpipe only ever changes `output.speakers` (when
+//! you run `airpipe use`, `add` or `remove`), editing it in place so comments
+//! and everything else are kept. Every key is optional; missing keys take the
+//! defaults below. Unknown keys are rejected so that typos do not silently do
+//! nothing.
 //!
 //! Precedence: command-line flags > config.toml > built-in defaults.
 
@@ -54,7 +56,7 @@ impl LatencyProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StartVolume {
-    /// Each speaker's `default_volume_db` from devices.toml (safe, predictable).
+    /// Each speaker's `default_volume` from devices.toml (safe, predictable).
     DeviceDefault,
     /// Whatever the desktop remembered from last time.
     Last,
@@ -73,7 +75,7 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
-    /// Speakers used by `airpipe run` when none are given on the command line.
+    /// Speakers airpipe plays to (set with `airpipe use`).
     pub speakers: Vec<String>,
     /// PipeWire node name of the output.
     pub node_name: String,
@@ -93,7 +95,7 @@ pub struct AudioConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct VolumeConfig {
     /// Follow the system volume of the AirPlay output. When false, every
-    /// speaker plays at its `default_volume_db` from devices.toml.
+    /// speaker plays at its `default_volume` from devices.toml.
     pub follow_system: bool,
     pub start: StartVolume,
 }
@@ -151,8 +153,9 @@ pub const TEMPLATE: &str = r#"# airpipe settings. All keys are optional; the val
 # Command-line flags override this file. Docs: README.md, "Configuration".
 
 [output]
-# Speakers played by `airpipe run` when none are given on the command line,
-# e.g. ["Bureau"] or ["Kitchen", "Living Room"] for a synchronized group.
+# Speakers to play to, e.g. ["Bureau"], or ["Kitchen", "Living Room"] for a
+# synchronized group. `airpipe use <speaker>...` sets this for you; after
+# editing by hand, run `airpipe reload`.
 speakers = []
 # PipeWire node name of the output.
 node_name = "airpipe"
@@ -172,11 +175,13 @@ idle_timeout_secs = 30
 
 [volume]
 # Follow the system volume of the AirPlay output (volume keys, desktop
-# slider, any mixer). When false, each speaker plays at its fixed
-# default_volume_db from devices.toml.
+# slider, any mixer). The slider covers each speaker's whole range: 40% is
+# 40% of what the speaker can do. When false, each speaker plays at its fixed
+# default_volume from devices.toml.
 follow_system = true
 # Volume when airpipe starts:
-#   "device-default"  each speaker's default_volume_db (devices.toml)
+#   "device-default"  each speaker's default_volume (devices.toml): low for
+#                     powerful speakers, higher for quiet ones
 #   "last"            whatever the desktop remembered from last time
 start = "device-default"
 
@@ -247,6 +252,42 @@ impl Config {
     }
 }
 
+/// Sets `output.speakers`, keeping the rest of the file (and its comments)
+/// as it is. Creates the file from the template if needed.
+pub fn save_speakers(path: &Path, speakers: &[String]) -> Result<()> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TEMPLATE.to_string(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let new = with_speakers(&text, speakers).with_context(|| format!("invalid {}", path.display()))?;
+    crate::store::write_private(path, &new)
+}
+
+/// `text` with `output.speakers` replaced; fails if the result is not a valid config.
+fn with_speakers(text: &str, speakers: &[String]) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    let output = doc.entry("output").or_insert(toml_edit::table());
+    let Some(output) = output.as_table_like_mut() else { bail!("[output] is not a table") };
+    let list: toml_edit::Array = speakers.iter().map(String::as_str).collect();
+    match output.get_mut("speakers") {
+        // Replace the value only, so a comment after it stays in place.
+        Some(item) => {
+            let decor = item.as_value().map(|v| v.decor().clone());
+            *item = toml_edit::value(list);
+            if let (Some(decor), Some(v)) = (decor, item.as_value_mut()) {
+                *v.decor_mut() = decor;
+            }
+        }
+        None => {
+            output.insert("speakers", toml_edit::value(list));
+        }
+    }
+    let new = doc.to_string();
+    Config::parse(&new)?;
+    Ok(new)
+}
+
 /// `$XDG_CONFIG_HOME/airpipe`, or `~/.config/airpipe` (XDG Base Directory spec).
 pub fn config_dir() -> Result<PathBuf> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute());
@@ -298,6 +339,23 @@ mod tests {
         assert!(Config::parse("[audio]\nlatency = \"fast\"\n").is_err());
         assert!(Config::parse("[audio]\nlatency_ms = 100\n").is_err());
         assert!(Config::parse("[network]\ntiming_port = 7000\ncontrol_port = 7000\n").is_err());
+    }
+
+    #[test]
+    fn saving_speakers_keeps_the_rest_of_the_file() {
+        let text = TEMPLATE.replace("latency = \"balanced\"", "latency = \"robust\" # my wifi is bad");
+        let new = with_speakers(&text, &["Kitchen".into(), "Living Room".into()]).unwrap();
+        assert!(new.contains("speakers = [\"Kitchen\", \"Living Room\"]"), "{new}");
+        assert!(new.contains("# my wifi is bad"), "{new}");
+        assert!(new.contains("# synchronized group"), "{new}");
+        let cfg = Config::parse(&new).unwrap();
+        assert_eq!(cfg.output.speakers, vec!["Kitchen", "Living Room"]);
+        assert_eq!(cfg.audio.latency, LatencyProfile::Robust);
+        // No [output] table yet, then back to none.
+        let new = with_speakers("[audio]\nidle_timeout_secs = 5\n", &["Bureau".into()]).unwrap();
+        assert_eq!(Config::parse(&new).unwrap().output.speakers, vec!["Bureau"]);
+        assert!(Config::parse(&with_speakers(&new, &[]).unwrap()).unwrap().output.speakers.is_empty());
+        assert!(with_speakers("[audio]\nlatnecy = 1\n", &[]).is_err(), "never writes an invalid file");
     }
 
     #[test]

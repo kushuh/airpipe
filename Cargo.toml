@@ -1,6 +1,6 @@
 [package]
 name = "airpipe"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Stream Linux system audio from PipeWire to AirPlay 2 speakers (sender only)"
@@ -23,7 +23,6 @@ remote control. Sender only: never acts as an AirPlay receiver."""
 assets = [
     ["target/release/airpipe", "usr/bin/", "755"],
     ["packaging/firewalld/airpipe.xml", "usr/lib/firewalld/services/", "644"],
-    ["packaging/systemd/airpipe@.service", "usr/lib/systemd/user/", "644"],
     ["packaging/systemd/airpipe.service", "usr/lib/systemd/user/", "644"],
     ["README.md", "usr/share/doc/airpipe/", "644"],
     ["LICENSE-MIT", "usr/share/doc/airpipe/", "644"],
@@ -37,7 +36,6 @@ auto-req = "auto"
 assets = [
     { source = "target/release/airpipe", dest = "/usr/bin/airpipe", mode = "755" },
     { source = "packaging/firewalld/airpipe.xml", dest = "/usr/lib/firewalld/services/airpipe.xml", mode = "644" },
-    { source = "packaging/systemd/airpipe@.service", dest = "/usr/lib/systemd/user/airpipe@.service", mode = "644" },
     { source = "packaging/systemd/airpipe.service", dest = "/usr/lib/systemd/user/airpipe.service", mode = "644" },
     { source = "README.md", dest = "/usr/share/doc/airpipe/README.md", mode = "644", doc = true },
     { source = "LICENSE-MIT", dest = "/usr/share/licenses/airpipe/LICENSE-MIT", mode = "644" },

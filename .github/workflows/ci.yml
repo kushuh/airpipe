@@ -167,9 +167,12 @@ jobs:
         run: |
           airpipe --version
           airpipe --help
-          test -f /usr/lib/systemd/user/airpipe@.service
           test -f /usr/lib/systemd/user/airpipe.service
           airpipe config
+          # Client commands explain how to start airpipe when it is not running.
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          ! airpipe status 2> status.err
+          grep -q 'systemctl --user enable --now airpipe.service' status.err
           test -f /usr/lib/firewalld/services/airpipe.xml
       - name: Uninstall
         run: |

@@ -8,7 +8,10 @@
 #      GitHub release and verifies its SHA-256 checksum.
 #   2. Installs it with the system package manager (zypper, dnf, apt).
 #   3. Optionally opens the firewall to the local network only (firewalld/ufw).
-#   4. Optionally starts an AirPlay output for a speaker at every login.
+#   4. Optionally starts airpipe in the background at every login
+#      (systemd user service), playing to the speaker you choose.
+#   On upgrades, a running airpipe is restarted on the new version, and
+#   setups from before 0.2 (airpipe@<speaker>.service) are moved over.
 #
 # Options:
 #   --version X.Y.Z   install a specific release instead of the latest
@@ -261,29 +264,84 @@ remove_firewall() {
 # --------------------------------------------------------------------------
 # auto-start
 
+# True if we can manage this user's systemd services.
+user_session() { [ "$(id -u)" != 0 ] && systemctl --user show-environment >/dev/null 2>&1; }
+
+# Before 0.2 each speaker had its own unit, airpipe@<speaker>.service. After
+# the new package is installed (so a failed install leaves them running),
+# stops and disables those and records their speakers in $OLD_SPEAKERS, one
+# per line, for finish_upgrade. Their template may be gone by then: systemd
+# still stops a loaded unit, and the symlink is removed by hand if needed.
+OLD_SPEAKERS=""
+stop_old_units() {
+    user_session || return 0
+    wants="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/default.target.wants"
+    units=$({
+        systemctl --user list-units 'airpipe@*' --all --plain --no-legend 2>/dev/null | awk '{print $1}'
+        for f in "$wants"/airpipe@*.service; do [ -e "$f" ] && basename "$f"; done
+    } | sort -u)
+    [ -n "$units" ] || return 0
+    step "Moving to the new background service"
+    for unit in $units; do
+        speaker=$(systemd-escape --unescape --instance "$unit" 2>/dev/null) || continue
+        [ -n "$speaker" ] || continue
+        OLD_SPEAKERS="$OLD_SPEAKERS$speaker
+"
+        run systemctl --user stop "$unit" || true
+        run systemctl --user disable "$unit" || run rm -f "$wants/$unit"
+        say "Stopped $unit."
+    done
+}
+
+# After installing: moves old units over to airpipe.service, or restarts a
+# running airpipe so the new version takes over (never two at once).
+finish_upgrade() {
+    user_session || return 0
+    run systemctl --user daemon-reload
+    if [ -n "$OLD_SPEAKERS" ]; then
+        old_ifs=$IFS
+        IFS='
+'
+        # shellcheck disable=SC2086 # one speaker name per line
+        set -- $OLD_SPEAKERS
+        IFS=$old_ifs
+        run airpipe use -- "$@" >/dev/null
+        run systemctl --user enable --now airpipe.service
+        say "airpipe now runs as airpipe.service, playing to: $(printf '%s' "$OLD_SPEAKERS" | paste -sd, -)."
+    elif systemctl --user is-active --quiet airpipe.service; then
+        run systemctl --user try-restart airpipe.service
+        say "Restarted airpipe.service on the new version."
+    fi
+}
+
 setup_service() {
     step "Start automatically"
     if [ "$(id -u)" = 0 ]; then
         say "Skipped: run the installer as your normal user (not with sudo) to set this up."
         return
     fi
-    if ! systemctl --user show-environment >/dev/null 2>&1; then
+    if ! user_session; then
         say "Skipped: no systemd user session."
         return
     fi
-    interactive || { say "Skipped (non-interactive). Later: systemctl --user enable --now 'airpipe@<speaker>'"; return; }
+    if systemctl --user is-enabled --quiet airpipe.service 2>/dev/null; then
+        say "airpipe already starts at login (airpipe.service). 'airpipe status' shows what it plays to."
+        return
+    fi
+    later="Later: airpipe use <speaker> && systemctl --user enable --now airpipe.service"
+    interactive || { say "Skipped (non-interactive). $later"; return; }
     say "Speakers on your network:"
     if [ "$DRY_RUN" = 1 ] || ! airpipe list; then
         say "  (could not list speakers)"
     fi
-    printf 'Speaker to play to automatically at login (empty to skip): ' >/dev/tty
+    printf 'Speaker to play to (empty to skip; add more later with airpipe add): ' >/dev/tty
     read -r speaker </dev/tty || speaker=""
-    [ -n "$speaker" ] || { say "Skipped."; return; }
-    unit="airpipe@$(systemd-escape "$speaker").service"
-    run systemctl --user daemon-reload
-    run systemctl --user enable --now "$unit"
-    say "Enabled $unit. Logs: journalctl --user -u '$unit'"
-    say "Settings: ~/.config/airpipe/config.toml and devices.toml (see 'airpipe config')."
+    [ -n "$speaker" ] || { say "Skipped. $later"; return; }
+    run airpipe use -- "$speaker" >/dev/null
+    run systemctl --user enable --now airpipe.service
+    say "airpipe runs in the background and at every login, playing to $speaker."
+    say "Choose \"AirPlay: $speaker\" as your sound output. 'airpipe status' shows what it does;"
+    say "logs: journalctl --user -u airpipe."
 }
 
 remove_services() {
@@ -365,9 +423,9 @@ case "$PKG" in
         tar -xzf "$TMP/$FILE" -C "$TMP"
         dir=$(find "$TMP" -mindepth 1 -maxdepth 1 -type d -name 'airpipe-*' | head -n1)
         as_root install -Dm755 "$dir/airpipe" /usr/local/bin/airpipe
-        for unit in airpipe@.service airpipe.service; do
-            as_root install -Dm644 "$dir/packaging/systemd/$unit" "/usr/local/lib/systemd/user/$unit"
-        done
+        as_root install -Dm644 "$dir/packaging/systemd/airpipe.service" /usr/local/lib/systemd/user/airpipe.service
+        # Removed in 0.2.
+        [ -e /usr/local/lib/systemd/user/airpipe@.service ] && as_root rm -f /usr/local/lib/systemd/user/airpipe@.service
         if [ -d /etc/firewalld ]; then
             as_root install -Dm644 "$dir/packaging/firewalld/airpipe.xml" /etc/firewalld/services/airpipe.xml
         fi
@@ -380,9 +438,12 @@ if [ "$DRY_RUN" = 0 ]; then
     say "Installed: $(airpipe --version)"
 fi
 
+stop_old_units
+finish_upgrade
 [ "$DO_FIREWALL" = 1 ] && setup_firewall
 [ "$DO_SERVICE" = 1 ] && setup_service
 
 step "Done"
-say "Run 'airpipe list' to see speakers and 'airpipe run <speaker>' to start an AirPlay output."
+say "'airpipe list' shows speakers, 'airpipe use <speaker>' chooses them, 'airpipe status' shows"
+say "what airpipe is doing. See 'airpipe --help'."
 say "Uninstall any time with the same script and --uninstall."
