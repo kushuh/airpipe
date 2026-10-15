@@ -50,7 +50,7 @@ const HEADER: &str = "\
 #                      system volume): low for powerful speakers, higher for quiet ones
 #   max_volume         hard cap; airpipe never plays this speaker louder
 #                      (100 = no cap, 0 = silent)
-#   latency_offset_ms  delay this speaker (-250..1000) to line up multi-room groups
+#   latency_offset_ms  delay this speaker (-1000..1000) to line up multi-room groups
 # This file contains a secret key: keep it private (mode 0600).
 ";
 

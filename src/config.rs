@@ -17,16 +17,24 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 /// Allowed values for an explicit `latency_ms` (also enforced by the CLI).
-pub const LATENCY_MS_RANGE: std::ops::RangeInclusive<u32> = 500..=10_000;
+/// Below ~250 ms, sound cuts out unless the network is excellent, and some
+/// speakers ignore the request; that is the user's call to make.
+pub const LATENCY_MS_RANGE: std::ops::RangeInclusive<u32> = 1..=10_000;
 
-/// Every speaker keeps at least this much audio buffered. Sent as AirPlay's
-/// `latencyMin` (the 250 ms OwnTone and Apple senders use).
+/// The buffer AirPlay senders normally require (OwnTone, Apple: 250 ms).
+/// Announced as `latencyMin`, unless the chosen latency is lower. A negative
+/// per-speaker offset never takes a speaker below it (or below the latency
+/// itself, if that is lower).
 pub const MIN_SPEAKER_BUFFER_MS: u32 = 250;
 
-/// Allowed per-speaker `latency_offset_ms` (devices.toml). The lower bound
-/// keeps [`MIN_SPEAKER_BUFFER_MS`] of buffer even at the smallest latency.
-pub const LATENCY_OFFSET_MS_RANGE: std::ops::RangeInclusive<i32> =
-    -((*LATENCY_MS_RANGE.start() - MIN_SPEAKER_BUFFER_MS) as i32)..=1000;
+/// Allowed per-speaker `latency_offset_ms` (devices.toml). Negative offsets
+/// are further limited by the engine (see [`MIN_SPEAKER_BUFFER_MS`]).
+pub const LATENCY_OFFSET_MS_RANGE: std::ops::RangeInclusive<i32> = -1000..=1000;
+
+/// Our own cushion against PipeWire's bursty delivery when `latency_ms` is
+/// below the low-latency preset: about one graph quantum (23 ms), so it adds
+/// as little delay as possible.
+const SMALL_JITTER_FRAMES: usize = 1024;
 
 /// Buffering presets. Audio is lossless at every setting; latency only
 /// trades responsiveness against robustness to network hiccups.
@@ -167,7 +175,9 @@ node_name = "airpipe"
 #   "robust"       ~2 s    no dropouts on busy or weak Wi-Fi
 # Video players compensate for the latency automatically.
 latency = "balanced"
-# Exact latency in milliseconds (500-10000); overrides `latency` when set.
+# Exact latency in milliseconds (1-10000); overrides `latency` when set.
+# Below ~250 sound may cut out unless your network is excellent, and some
+# speakers do not go that low.
 # latency_ms = 1500
 # Release speakers after this many seconds without audio, so other devices
 # (phones, other computers) can use them.
@@ -203,7 +213,11 @@ impl Config {
     /// Effective (latency in ms, jitter cushion in frames).
     pub fn latency(&self) -> (u32, usize) {
         let (profile_ms, jitter) = self.audio.latency.parameters();
-        (self.audio.latency_ms.unwrap_or(profile_ms), jitter)
+        match self.audio.latency_ms {
+            Some(ms) if ms < LatencyProfile::LowLatency.parameters().0 => (ms, SMALL_JITTER_FRAMES),
+            Some(ms) => (ms, jitter),
+            None => (profile_ms, jitter),
+        }
     }
 
     pub fn idle_timeout(&self) -> Duration {
@@ -331,13 +345,17 @@ mod tests {
         assert_eq!(cfg.latency(), (1500, 4096));
         let cfg = Config::parse("[audio]\nlatency = \"low-latency\"\n").unwrap();
         assert_eq!(cfg.latency().0, 500);
+        // Very low latencies also get a small cushion of our own.
+        let cfg = Config::parse("[audio]\nlatency_ms = 5\n").unwrap();
+        assert_eq!(cfg.latency(), (5, SMALL_JITTER_FRAMES));
     }
 
     #[test]
     fn typos_and_bad_values_are_rejected() {
         assert!(Config::parse("[audio]\nlatnecy = \"robust\"\n").is_err());
         assert!(Config::parse("[audio]\nlatency = \"fast\"\n").is_err());
-        assert!(Config::parse("[audio]\nlatency_ms = 100\n").is_err());
+        assert!(Config::parse("[audio]\nlatency_ms = 0\n").is_err());
+        assert!(Config::parse("[audio]\nlatency_ms = 10001\n").is_err());
         assert!(Config::parse("[network]\ntiming_port = 7000\ncontrol_port = 7000\n").is_err());
     }
 

@@ -196,8 +196,9 @@ impl Engine {
     ///
     /// `offset_ms` delays this speaker relative to the group (OwnTone's
     /// convention: positive plays later). devices.toml already limits it to
-    /// `LATENCY_OFFSET_MS_RANGE`; the clamp here guarantees the speaker keeps
-    /// `MIN_SPEAKER_BUFFER_MS` of buffer whatever the caller passes.
+    /// `LATENCY_OFFSET_MS_RANGE`; the clamp here guarantees a negative offset
+    /// never leaves the speaker less than `MIN_SPEAKER_BUFFER_MS` of buffer
+    /// (or the latency itself, if lower), whatever the caller passes.
     pub fn add_target(
         &self,
         speaker: std::net::IpAddr,
