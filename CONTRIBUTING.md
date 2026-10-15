@@ -177,7 +177,11 @@ request:
 | installer (distros) | real install and uninstall on Ubuntu (apt), Fedora (dnf), openSUSE (zypper) |
 
 Dependabot (`.github/dependabot.yml`) opens weekly PRs for action pins and
-Rust dependencies. Releases additionally get a signed build provenance
+Rust dependencies, proposing only releases at least a week old. Minor and
+patch updates merge by themselves once CI passes
+(`.github/workflows/dependabot-auto-merge.yml`); major updates and `plist`
+wait for review. If a Dependabot PR is stuck behind `main`, comment
+`@dependabot rebase`. Releases additionally get a signed build provenance
 attestation (`actions/attest-build-provenance`).
 
 If a dependency raises the minimum Rust version, update `rust-version` in

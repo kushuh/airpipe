@@ -1,11 +1,22 @@
 # Weekly update PRs for the pinned GitHub Actions (SHA pins go stale) and
 # for Rust dependencies. CI runs the full suite, including cargo-deny, on each.
+#
+# Minor and patch updates merge automatically once CI passes
+# (.github/workflows/dependabot-auto-merge.yml). To keep that safe and smooth:
+# * cooldown: a release must be a week old before it is proposed, so a
+#   compromised or broken version is usually yanked before it reaches us
+#   (security updates are not delayed);
+# * one grouped PR per ecosystem, on different days: `main` requires PRs to
+#   be up to date, so two PRs at once would block each other.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+      day: wednesday
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -13,6 +24,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
     groups:
       minor-and-patch:
         update-types: [minor, patch]

@@ -1,0 +1,35 @@
+# Turns on auto-merge for Dependabot's minor and patch updates: GitHub then
+# squash-merges the PR once every required CI check has passed, exactly as if
+# a maintainer had clicked "Enable auto-merge". Nothing is merged on red CI.
+#
+# Left for a human: major updates (they may need code changes, and release.yml
+# only runs on tags, so CI cannot catch a broken release action), and the
+# plist crate, which is pinned on purpose (see Cargo.toml).
+#
+# Uses `pull_request` (not `pull_request_target`) and never checks out code.
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    # Both checks: the PR is Dependabot's, and Dependabot triggered this run.
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: Enable auto-merge
+        if: >-
+          (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+           steps.meta.outputs.update-type == 'version-update:semver-minor') &&
+          !contains(steps.meta.outputs.dependency-names, 'plist')
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ github.token }}
