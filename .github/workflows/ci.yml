@@ -22,7 +22,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
@@ -35,7 +35,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build-deps
@@ -54,7 +54,7 @@ jobs:
     name: test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build-deps
@@ -69,7 +69,7 @@ jobs:
     name: MSRV (Rust 1.89)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build-deps
@@ -83,7 +83,7 @@ jobs:
     name: cargo-deny (advisories, licenses, sources)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
@@ -94,7 +94,7 @@ jobs:
     name: package
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build-deps
@@ -117,7 +117,7 @@ jobs:
           rpm -qip dist/*.rpm
           rpm -qlp dist/*.rpm
           rpm -qRp dist/*.rpm | grep libpipewire
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/
@@ -127,7 +127,7 @@ jobs:
     name: installer (shellcheck, dash)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: shellcheck --shell=sh packaging/install.sh packaging/build-dist.sh
@@ -152,10 +152,10 @@ jobs:
             prepare: zypper --non-interactive install gawk findutils
     container: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist
