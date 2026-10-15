@@ -1,0 +1,24 @@
+# systemd *user* unit: the AirPlay output configured in
+# ~/.config/airpipe/config.toml (output.speakers).
+#
+#   systemctl --user enable --now airpipe.service
+#
+# For a one-speaker setup without editing config.toml, use
+# airpipe@<speaker>.service instead. Enable only one of them: a single airpipe
+# runs at a time.
+
+[Unit]
+Description=AirPlay output (speakers from ~/.config/airpipe/config.toml)
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+# A bare name is looked up in /usr/local/bin, /usr/bin, ... by systemd.
+ExecStart=airpipe run
+Restart=on-failure
+RestartSec=5
+# Use airpipe=debug when troubleshooting (journalctl --user -u airpipe).
+Environment=RUST_LOG=airpipe=info
+
+[Install]
+WantedBy=default.target

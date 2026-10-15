@@ -1,0 +1,10 @@
+name: Install build dependencies
+description: System packages needed to compile airpipe (PipeWire headers, libclang for bindgen).
+runs:
+  using: composite
+  steps:
+    - name: apt-get install
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev libclang-dev clang pkg-config

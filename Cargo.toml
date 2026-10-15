@@ -1,0 +1,77 @@
+[package]
+name = "airpipe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Stream Linux system audio from PipeWire to AirPlay 2 speakers (sender only)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kushuh/airpipe"
+readme = "README.md"
+keywords = ["airplay", "pipewire", "audio", "streaming"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
+# Packaging (used by the release workflow; see .github/workflows/release.yml).
+[package.metadata.deb]
+maintainer = "kushuh"
+section = "sound"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+Adds a PipeWire output device that streams to AirPlay 2 speakers, with \
+multi-room sync, system volume control, now-playing metadata and speaker \
+remote control. Sender only: never acts as an AirPlay receiver."""
+assets = [
+    ["target/release/airpipe", "usr/bin/", "755"],
+    ["packaging/firewalld/airpipe.xml", "usr/lib/firewalld/services/", "644"],
+    ["packaging/systemd/airpipe@.service", "usr/lib/systemd/user/", "644"],
+    ["packaging/systemd/airpipe.service", "usr/lib/systemd/user/", "644"],
+    ["README.md", "usr/share/doc/airpipe/", "644"],
+    ["LICENSE-MIT", "usr/share/doc/airpipe/", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/airpipe/", "644"],
+]
+
+[package.metadata.generate-rpm]
+# Requirements (libpipewire, glibc) are detected from the binary's sonames,
+# which works across Fedora and openSUSE package naming.
+auto-req = "auto"
+assets = [
+    { source = "target/release/airpipe", dest = "/usr/bin/airpipe", mode = "755" },
+    { source = "packaging/firewalld/airpipe.xml", dest = "/usr/lib/firewalld/services/airpipe.xml", mode = "644" },
+    { source = "packaging/systemd/airpipe@.service", dest = "/usr/lib/systemd/user/airpipe@.service", mode = "644" },
+    { source = "packaging/systemd/airpipe.service", dest = "/usr/lib/systemd/user/airpipe.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/airpipe/README.md", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/airpipe/LICENSE-MIT", mode = "644" },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/airpipe/LICENSE-APACHE", mode = "644" },
+]
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[dependencies]
+anyhow = "1.0.104"
+chacha20poly1305 = "0.11.0"
+clap = { version = "4.6.7", features = ["derive"] }
+ed25519-dalek = "3.0.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+getrandom = "0.4.3"
+hex = "0.4.3"
+hkdf = "0.13.0"
+libc = "0.2.190"
+num-bigint = "0.5.1"
+pipewire = "0.10.1"
+# Exact version: the iterative event reader used to vet untrusted plists
+# (src/proto/plist.rs) is behind this "unstable" feature. Upgrades are
+# reviewed by hand (CI fails to compile if the API changes).
+plist = { version = "=1.10.1", features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
+rtrb = "0.4.0"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["fs", "io-std", "io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+toml = "1.1.8"
+toml_edit = "0.25.17"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }

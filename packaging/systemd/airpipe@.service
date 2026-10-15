@@ -1,0 +1,30 @@
+# systemd *user* unit: an AirPlay output for one speaker.
+# Only one airpipe can run at a time (it owns UDP ports 6111-6112): to play to
+# several speakers, use airpipe.service with output.speakers in config.toml.
+#
+#   systemctl --user enable --now 'airpipe@Bureau.service'
+#
+# The instance name is the speaker name as shown by `airpipe list`
+# (escape spaces with `systemd-escape`, e.g. 'airpipe@Living\x20Room').
+# For several speakers in one group, or extra flags, override ExecStart with
+# `systemctl --user edit airpipe@<name>`.
+#
+# Packages install this file to /usr/lib/systemd/user/. With `cargo install`,
+# copy it to ~/.config/systemd/user/ and change ExecStart to
+# %h/.cargo/bin/airpipe.
+
+[Unit]
+Description=AirPlay output for %I
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+# A bare name is looked up in /usr/local/bin, /usr/bin, ... by systemd.
+ExecStart=airpipe run "%I"
+Restart=on-failure
+RestartSec=5
+# Use airpipe=debug when troubleshooting (journalctl --user -u 'airpipe@*').
+Environment=RUST_LOG=airpipe=info
+
+[Install]
+WantedBy=default.target

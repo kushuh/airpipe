@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Inbound ports airpipe needs while it streams TO AirPlay speakers.
+  None of them accept audio or video: airpipe is a sender only.
+  Keep these in sync with the defaults in src/config.rs.
+-->
+<service>
+  <short>airpipe</short>
+  <description>airpipe AirPlay 2 sender: clock-sync requests (6111/udp) and retransmit requests (6112/udp) coming back from the speakers.</description>
+  <port protocol="udp" port="6111"/>
+  <port protocol="udp" port="6112"/>
+</service>

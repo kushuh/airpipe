@@ -1,0 +1,32 @@
+# cargo-deny configuration: run `cargo deny check` locally, CI runs it on every push.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# airpipe is Linux-only; don't audit Windows/macOS-only dependencies.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Everything here is compatible with distributing airpipe as MIT OR Apache-2.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
