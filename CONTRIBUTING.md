@@ -27,12 +27,16 @@ written to be read in pieces: every section stands on its own.
 These are hard requirements; reviews check them.
 
 1. **Sender only.** airpipe must never accept audio or video from the
-   network, and never advertise itself over mDNS. Do not add listeners
-   beyond the timing and control UDP ports, and keep both answering only
-   speakers airpipe is using (`stream::timing::AllowedPeers`, engine
-   targets). See [SECURITY.md](SECURITY.md).
+   network, and never advertise itself over mDNS. Do not add network
+   listeners beyond the timing and control UDP ports, and keep both
+   answering only speakers airpipe is using (`stream::timing::AllowedPeers`,
+   engine targets). The only other listener is the local control socket
+   (`src/control.rs`), for the current user only. See
+   [SECURITY.md](SECURITY.md).
 2. **Volume safety.** No code path may send a speaker more than its
-   `max_volume_db`. Every volume is computed by `src/group/volume.rs`, and
+   `max_volume`, and with `start = "device-default"` a fresh start or added
+   speakers play at the speakers' `default_volume`. Every volume is computed by
+   `src/group/volume.rs`, and
    `session::volume_body` clamps to 0 dB as a last resort. Changes to either
    need tests.
 3. **No surprise network access.** airpipe talks only to speakers on the
@@ -115,7 +119,9 @@ firewall open as described in the README's
 | The PipeWire output device                | `src/sink.rs`                                    |
 | Speaker discovery                         | `src/discovery.rs`                               |
 | Settings files                            | `src/config.rs`, `src/store.rs`                  |
-| Command-line interface and console        | `src/main.rs`                                    |
+| Command-line interface                    | `src/main.rs`                                    |
+| `airpipe status`/`use`/`stop`, one instance | `src/control.rs`, `Group::on_request`          |
+| Giving the default output back on stop    | `src/default_output.rs`                          |
 | Installer, packages, systemd, firewall    | `packaging/`                                     |
 
 ## Testing
@@ -129,18 +135,21 @@ independently computed vectors. New code in `src/proto/`, `src/crypto/`,
 
 ### On real speakers
 
-> **Volume first.** AirPlay 0 dB is a speaker's full power, and some speakers
-> are very loud. Test with a low ceiling and quiet sounds:
-> `airpipe tone` plays a soft tone at -28 dB by default; for `run`, pass
-> `--max-volume -28`.
+> **Volume first.** 100% is a speaker's full power, and some speakers are
+> very loud. Test with a low cap and quiet sounds: `airpipe tone` plays a
+> soft tone at 5% by default; for `run`, pass `--max-volume 7` (about
+> -28 dB).
 
 ```sh
 RUST_LOG=airpipe=debug cargo run -- list
 RUST_LOG=airpipe=debug cargo run -- info "<speaker>"
 RUST_LOG=airpipe=debug cargo run -- tone "<speaker>"     # protocol only, no PipeWire
 
-RUST_LOG=airpipe=debug cargo run -- run "<speaker>" --max-volume -28
+cargo run -- stop                       # if the installed airpipe is running
+cargo run -- use "<speaker>"
+RUST_LOG=airpipe=debug cargo run -- run --max-volume 7
 # in another terminal:
+cargo run -- status
 pactl set-sink-volume airpipe 50%
 pw-play --target airpipe some-quiet-file.wav
 ```
@@ -149,7 +158,7 @@ pw-play --target airpipe some-quiet-file.wav
 which is the main tool for protocol work.
 
 To test without touching your own settings, use a throwaway configuration:
-`XDG_CONFIG_HOME=$(mktemp -d) cargo run -- run "<speaker>"`.
+`export XDG_CONFIG_HOME=$(mktemp -d)` in both terminals.
 
 ## Continuous integration
 
@@ -189,7 +198,6 @@ cargo metadata --format-version 1 --filter-platform x86_64-unknown-linux-gnu \
 | `packaging/install.sh`                | Attached to each release (one-line installer)   |
 | `packaging/build-dist.sh`             | Builds release artifacts (used by CI)           |
 | `packaging/firewalld/airpipe.xml`     | `/usr/lib/firewalld/services/`                  |
-| `packaging/systemd/airpipe@.service`  | `/usr/lib/systemd/user/`                        |
 | `packaging/systemd/airpipe.service`   | `/usr/lib/systemd/user/`                        |
 
 Package contents are declared in `Cargo.toml` under

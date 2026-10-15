@@ -59,11 +59,40 @@ It is written for reviewers and contributors.
 | `random.rs`           | The single source of randomness (keys, nonces, IDs), from the OS        | yes  |
 | `config.rs`           | Global settings (`config.toml`), defaults, validation                  | no*  |
 | `store.rs`            | Device memory (`devices.toml`): identity, per-speaker settings, keys   | yes  |
-| `main.rs`             | CLI and interactive console                                            | yes  |
+| `control.rs`          | Control socket (`status`, `reload`, `gain`, `stop`), single instance   | yes  |
+| `default_output.rs`   | Gives the previous default output back when airpipe stops              | yes  |
+| `main.rs`             | CLI: standalone commands, and the client side of the control socket    | yes  |
 
 Everything marked "no I/O" is pure and has byte-level unit tests.
-(*`config.rs` parsing is pure; loading reads the file, and `run` creates the
-commented template on first use.)
+(*`config.rs` parsing is pure; loading reads the file, `run` creates the
+commented template on first use, and `use` edits the speaker list.)
+
+## Background service and control socket
+
+`airpipe run` is the long-running process, normally started by the systemd
+user unit `airpipe.service`. The other commands either work alone (`list`,
+`info`, `pair`, `unpair`, `tone`, `config`) or talk to it through
+`$XDG_RUNTIME_DIR/airpipe.sock` (`control.rs`): one tab-separated request
+line, answered by `ok`/`error` and text. `use`, `add` and `remove` write
+`output.speakers` in `config.toml`, then send `reload`; so the file is the
+single source of truth for the speakers, and works the same whether airpipe
+is running or not.
+
+`run` first takes an exclusive lock on `$XDG_RUNTIME_DIR/airpipe.lock`. A
+second airpipe exits with status 3, which the unit lists in
+`RestartPreventExitStatus`, so two never run at once (they would fight over
+the output and the UDP ports). Holding the lock also makes it safe to remove
+a socket file left by a crash.
+
+On `reload`, the group scans the network in a background task, then
+`Group::on_resolved` releases speakers no longer listed, adds new ones,
+re-reads `devices.toml`, and renames the output.
+
+When airpipe stops (`airpipe stop`, SIGTERM, Ctrl-C), `default_output.rs`
+checks PipeWire's `default` metadata: if our output is the configured
+default, it sets the previous one again (or clears the key so WirePlumber
+picks the best output), waiting for PipeWire to confirm before the output
+disappears.
 
 ## Threads
 
@@ -72,7 +101,7 @@ commented template on first use.)
 | `airpipe-pipewire`| PipeWire main loop; `process` runs on PipeWire's RT data thread | PipeWire objects are not `Send` |
 | `airpipe-audio`   | Packet engine, paced by absolute deadlines         | Audio timing must not depend on async scheduling |
 | `airpipe-timing`  | Blocking UDP responder                             | Low-latency replies improve clock estimates |
-| tokio (1 thread)  | RTSP sessions, event channels, discovery, MPRIS, group controller | Light concurrent I/O, none of it timing-critical; one thread is plenty |
+| tokio (1 thread)  | RTSP sessions, event channels, discovery, MPRIS, control socket, group controller | Light concurrent I/O, none of it timing-critical; one thread is plenty |
 
 Data crosses threads in these ways only:
 
@@ -204,13 +233,15 @@ cushion, the buffer skips ahead so latency stays bounded.
   scaled, and reports the slider position (`cbrt(linear)`) and mute state.
   With `follow_system = false` it leaves software volume alone, and the
   slider attenuates digitally like on any device.
-* Each speaker maps the slider linearly onto `-30 dB … max_volume_db` from
-  `devices.toml`, plus a live console trim and an optional `--max-volume`
-  cap. The result is clamped to the ceiling (`group::volume::VolumeInputs`).
-* At start-up the slider is moved to the position where the speakers play
-  their `default_volume_db` (the lowest such position across the group).
-  WirePlumber may restore a remembered volume onto the new node right after
-  that, so airpipe re-asserts its level for the first 3 seconds.
+* The slider covers every speaker's full range, linearly in dB: 0% is
+  -30 dB (AirPlay's quietest step), 100% is 0 dB (full power). Then the
+  live `airpipe gain` trim applies, and the result is clamped to the
+  speaker's `max_volume` and the optional `--max-volume` cap
+  (`group::volume::VolumeInputs`).
+* At start-up, and when speakers are added, the slider is moved to the
+  speakers' `default_volume` (the lowest across the group). WirePlumber may
+  restore a remembered volume onto the new node right after start-up, so
+  airpipe re-asserts its level for the first 3 seconds.
 
 ### Latency reporting
 
@@ -223,8 +254,9 @@ graph's latency reporting and delay video accordingly.
 Everything lives in `$XDG_CONFIG_HOME/airpipe/` (usually `~/.config/airpipe/`):
 
 * `config.toml` holds global settings. It is written once from
-  `config::TEMPLATE` and then belongs to the user. Unknown keys are errors,
-  so typos are caught.
+  `config::TEMPLATE` and then belongs to the user; airpipe only changes
+  `output.speakers` (with `toml_edit`, keeping comments). Unknown keys are
+  errors, so typos are caught.
 * `devices.toml` (mode 0600) holds the device memory. `[controller]` has our
   Ed25519 key, pairing identifier and device ID. `[devices."<deviceid>"]`
   has one entry per discovered AirPlay target, with its settings and, after
@@ -242,4 +274,4 @@ Everything lives in `$XDG_CONFIG_HOME/airpipe/` (usually `~/.config/airpipe/`):
   runaway source), volume mapping and storage. The HKDF test vector comes
   from an independent implementation (Python's `hmac`), not our own code.
 * **Hardware tests** use `airpipe tone` (protocol only) and `airpipe run`
-  plus `pw-play` (full path). See CONTRIBUTING.md.
+  plus `pw-play` (full path), always with a low volume cap. See CONTRIBUTING.md.

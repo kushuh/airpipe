@@ -15,8 +15,9 @@ terminal or in the background.
 * **Any app, any desktop:** it is a normal sound output; there is nothing
   to set up in your apps.
 * **Volume just works:** your volume keys and slider control the speakers.
-  Each speaker starts at a comfortable level, and a per-speaker ceiling
-  keeps it from ever playing at dangerous volumes.
+  The slider covers each speaker's whole range, and each speaker starts at
+  a safe level (lower for powerful speakers); an optional per-speaker limit
+  caps it.
 * **Several speakers in sync:** play to multiple AirPlay speakers at once,
   perfectly in time (multi-room).
 * **Now playing:** speakers and their apps show the title, artist and
@@ -76,9 +77,13 @@ build from source, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick start
 
+airpipe runs in the background, and you control it with short commands.
+The installer offers to set this up. To do it by hand:
+
 ```sh
-airpipe list            # show the AirPlay speakers on your network
-airpipe run Kitchen     # create the "AirPlay: Kitchen" output
+airpipe list                                  # show the AirPlay speakers on your network
+airpipe use Kitchen                           # choose the speaker to play to
+systemctl --user enable --now airpipe.service # run airpipe now and at every login
 ```
 
 Now choose **AirPlay: Kitchen** as the output in your sound settings and
@@ -87,33 +92,24 @@ play something. Sound starts on the speaker after about a second.
 Several speakers in sync:
 
 ```sh
-airpipe run Kitchen "Living Room"
+airpipe use Kitchen "Living Room"
 ```
 
-While `airpipe run` is open, you can type commands:
+Everyday commands:
 
-| Command               | What it does                                           |
-|-----------------------|--------------------------------------------------------|
-| `status`              | Show speakers, their volume, and any error             |
-| `gain <speaker> <dB>` | Make one speaker quieter for now, e.g. `gain Kitchen -6` |
-| `reload`              | Re-read `devices.toml` after editing it                |
-| `add <speaker>`       | Add a speaker to the group                             |
-| `remove <speaker>`    | Remove a speaker from the group                        |
-| `quit`                | Stop (Ctrl-C works too)                                |
+| Command                       | What it does                                              |
+|-------------------------------|-----------------------------------------------------------|
+| `airpipe status`              | Show speakers, their volume, and any error                |
+| `airpipe use <speaker>...`    | Play to these speakers (remembered in `config.toml`)      |
+| `airpipe add <speaker>`       | Add a speaker                                             |
+| `airpipe remove <speaker>`    | Stop using a speaker                                      |
+| `airpipe gain <speaker> <dB>` | Make one speaker of a group quieter for now, e.g. `-6`    |
+| `airpipe reload`              | Apply speaker changes in `config.toml`, edits to `devices.toml` |
+| `airpipe stop`                | Stop airpipe; sound goes back to your previous output     |
 
-### Start automatically
-
-```sh
-systemctl --user enable --now 'airpipe@Kitchen.service'    # one speaker
-systemctl --user enable --now airpipe.service              # speakers listed in config.toml
-```
-
-Enable only one of the two: a single airpipe runs at a time. To play to
-several speakers, list them all in one group (`output.speakers` in
-`config.toml`, or `airpipe run Kitchen "Living Room"`).
-
-Speaker names with spaces need escaping:
-`systemctl --user enable --now "airpipe@$(systemd-escape 'Living Room').service"`.
+If airpipe is not running, these commands tell you how to start it. To
+run it in a terminal instead of in the background, use `airpipe run`
+(Ctrl-C stops it). Only one airpipe runs at a time.
 
 ### Speakers that ask for a PIN or password
 
@@ -133,12 +129,13 @@ Settings live in two files in `~/.config/airpipe/`, created on first run.
 
 ### `config.toml`: general settings
 
-Created with comments explaining every option; airpipe never changes it
-after that. The most useful settings:
+Created with comments explaining every option. airpipe only ever changes
+the speaker list in it (`airpipe use`, `add`, `remove`), keeping everything
+else and your comments. The most useful settings:
 
 ```toml
 [output]
-speakers = ["Kitchen"]         # used by `airpipe run` with no speaker names
+speakers = ["Kitchen"]         # set by `airpipe use`
 
 [audio]
 latency = "balanced"           # "low-latency", "balanced" or "robust"
@@ -146,9 +143,12 @@ idle_timeout_secs = 30         # free the speakers after this much silence
 
 [volume]
 follow_system = true           # volume keys and slider control the speakers
-start = "device-default"       # start each speaker at its comfortable level
+start = "device-default"       # start at each speaker's default volume
                                # ("last" keeps the volume from last time)
 ```
+
+Speaker changes apply with `airpipe reload`; other settings when airpipe
+restarts (`systemctl --user restart airpipe`).
 
 **Latency:** sound always arrives in full quality. Latency is only the delay
 before you hear it, and how much Wi-Fi trouble it can absorb:
@@ -172,35 +172,31 @@ speaker is one entry.
 [devices."50:5B:C2:9C:79:E5"]
 name = "Kitchen"
 model = "Devialet Phantom 103 dB"
-max_volume_db = -20.0       # how loud 100% volume is for this speaker
-default_volume_db = -26.0   # comfortable level used at start-up
+default_volume = 25         # % volume set when airpipe starts
+max_volume = 100            # % never exceeded (100 = no limit, 0 = silent)
 latency_offset_ms = 0       # delay this speaker to line it up with others
 ```
 
-After editing, type `reload` in a running `airpipe run`, or restart it.
+After editing, run `airpipe reload`.
 
 ## Volume
 
 Your system volume controls the speakers, on every desktop, with no setup.
+The volume slider covers each speaker's whole range: **40% is 40% of what
+the speaker can do**, and 100% is its full power, which is dangerously loud
+on some speakers. So:
 
-AirPlay volume ranges from **-30 dB** (quietest) to **0 dB**, which is the
-speaker's **full power**: dangerously loud on some speakers. So each
-speaker has its own range:
-
-```
-system volume   0% ───────────────────────── 100%
-speaker         silent   -30 dB ───────▶ max_volume_db
-```
-
-* **100% volume plays at `max_volume_db`, never louder.**
-* **At start-up the volume is set to `default_volume_db`**, so a fresh
-  start is never too loud.
-* Speakers known to be very powerful (Devialet, Bang & Olufsen, Klipsch,
-  KEF, McIntosh) start with a ceiling of -20 dB and a comfortable level of
-  -26 dB. Other speakers start with -10 dB and -20 dB.
-* To allow louder playback, raise `max_volume_db` for that speaker in
-  `devices.toml`, a few dB at a time.
-* For a one-off quieter session: `airpipe run Kitchen --max-volume -28`.
+* **When airpipe starts, the volume is set to the speaker's
+  `default_volume`** (and again when speakers are added), so a
+  fresh start is never too loud. Speakers known to be very powerful
+  (Devialet, Bang & Olufsen, Klipsch, KEF, McIntosh) start at 25%, others
+  (TVs, soundbars, small speakers) at 50%. Change it per speaker in
+  `devices.toml`.
+* **`max_volume`** in `devices.toml` is a hard limit for one speaker: airpipe
+  never plays it louder, whatever the slider says. It is 100% (no limit)
+  unless you lower it.
+* For a one-off quiet session: `airpipe stop`, then
+  `airpipe run --max-volume 10`.
 
 ## Troubleshooting
 
@@ -220,7 +216,7 @@ speaker         silent   -30 dB ───────▶ max_volume_db
   is not at zero or muted.
 * Your firewall must allow UDP 6111 and 6112 from your network (see
   [Firewall](#firewall)).
-* Type `status` in `airpipe run` to see errors.
+* Run `airpipe status` to see errors.
 
 **Sound cuts out**
 
@@ -239,9 +235,25 @@ Run `airpipe pair <speaker>` once (see
 
 **Where are the logs?**
 
-`airpipe run` prints to the terminal. For the background service:
-`journalctl --user -u 'airpipe@*' -u airpipe`. For more detail, run with
+For the background service: `journalctl --user -u airpipe`. `airpipe run`
+in a terminal prints to the terminal. For more detail, run with
 `RUST_LOG=airpipe=debug`.
+
+**"airpipe is already running"**
+
+Only one airpipe runs at a time. `airpipe stop` stops the running one
+(background or terminal).
+
+**Upgrading from 0.1**
+
+Run the installer again: it moves `airpipe@<speaker>.service` setups to
+`airpipe.service` with the same speakers. Volumes in `devices.toml` change
+from dB (`max_volume_db`, `default_volume_db`) to percentages
+(`default_volume`, `max_volume`); airpipe replaces the old keys with the
+new defaults the first time it starts. **100% volume now means the
+speaker's full power:** the old -20 dB ceiling of powerful speakers is
+gone, and they start at 25% instead. To keep a hard limit, set
+`max_volume` (e.g. `max_volume = 33` is the old -20 dB).
 
 ### Firewall
 

@@ -20,20 +20,24 @@
 //! never takes a speaker back from another device mid-playback.
 //!
 //! [`run`] sets everything up, then `Group` reacts to one event at a time;
-//! each `on_*` method handles one event source. Volume rules live in
-//! [`volume`].
+//! each `on_*` method handles one event source. Requests from `airpipe
+//! status`, `reload` (also sent by `use`, `add`, `remove`)... arrive through
+//! the control socket ([`crate::control`]). Volume rules live in [`volume`].
 
 pub mod volume;
 
+use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use crate::airplay::events::RemoteCommand;
 use crate::airplay::session::{self, Command, SessionContext, SessionEvent, SessionHandle, SessionId};
 use crate::config::{Config, StartVolume};
+use crate::control::{self, Reply, Request};
 use crate::discovery::{self, Device, feature};
 use crate::mpris::{self, Artwork, MediaEvent};
 use crate::proto::dmap::TrackInfo;
@@ -43,7 +47,7 @@ use crate::sink::{Sink, SinkConfig};
 use crate::store::{DeviceSettings, Store};
 use crate::stream::timing::{AllowedPeers, PeerPermit, TimingServer};
 use crate::stream::{self, Engine, EngineConfig, TargetId};
-use volume::{MIN_DB, SystemVolume, VolumeInputs};
+use volume::{MIN_DB, MUTED_DB, SystemVolume, VolumeInputs};
 
 /// Seconds to wait before reconnecting, by number of consecutive failures.
 const RETRY_BACKOFF: [u64; 5] = [2, 5, 10, 30, 60];
@@ -54,18 +58,25 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 /// Positions older than this are not used for progress.
 const STALE_POSITION: Duration = Duration::from_secs(3);
 /// After start-up the desktop may restore a remembered volume onto our new
-/// output. During this window we re-assert the start-up level.
+/// output, and a volume report from before a speaker change may still be
+/// queued. During this window we re-assert the level we set.
 const START_VOLUME_WINDOW: Duration = Duration::from_secs(3);
 /// Pending remote-control commands from speakers; extra ones are dropped.
 const REMOTE_QUEUE: usize = 8;
 
-/// What a group needs to run: the effective settings plus the speakers.
+/// What a group needs to run. The speakers are `config.output.speakers`.
 pub struct GroupConfig {
+    /// Effective settings (config.toml plus command-line flags).
     pub config: Config,
-    pub speakers: Vec<String>,
-    /// Extra ceiling on top of every speaker's own (`--max-volume`).
-    pub volume_cap_db: Option<f32>,
+    /// Where config.toml is, to re-read the speakers on `reload`.
+    pub config_path: PathBuf,
+    /// Extra cap on top of every speaker's own (`--max-volume`), as a slider position.
+    pub volume_cap: Option<f32>,
 }
+
+/// Applied to the new speakers on reload; other settings need a restart.
+const RELOAD_NOTE: &str = "speakers and devices.toml volumes applied; latency offsets apply on the next \
+     connection, other config.toml settings after `systemctl --user restart airpipe`";
 
 /// The parts shared by `airpipe run` and `airpipe tone`: the clock service,
 /// the audio engine, and what every session needs to know.
@@ -127,22 +138,6 @@ async fn connect(
     Ok((session, permit))
 }
 
-/// Commands from the interactive console.
-#[derive(Debug)]
-pub enum ConsoleCommand {
-    Status,
-    /// Live per-speaker trim in dB, on top of devices.toml settings.
-    Gain {
-        speaker: String,
-        db: f32,
-    },
-    /// Re-read devices.toml and apply volume settings.
-    Reload,
-    Add(String),
-    Remove(String),
-    Quit,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemberState {
     Idle,
@@ -167,6 +162,8 @@ struct Member {
     permit: Option<PeerPermit>,
     target: Option<TargetId>,
     failures: usize,
+    /// The current connection attempt; results of older ones are dropped.
+    attempt: u64,
     last_error: Option<String>,
 }
 
@@ -182,6 +179,7 @@ impl Member {
             permit: None,
             target: None,
             failures: 0,
+            attempt: 0,
             last_error: None,
         }
     }
@@ -194,7 +192,51 @@ impl Member {
 /// Result of a background connection attempt.
 struct Connected {
     name: String,
+    /// Which attempt this is (see `Member::attempt`).
+    attempt: u64,
     result: Result<(DeviceSettings, SessionHandle, PeerPermit)>,
+}
+
+/// A new speaker list and what discovery found for it (see `Group::on_resolved`).
+struct Resolved {
+    /// Which reload this answers (see `Group::reloads`).
+    reload: u64,
+    speakers: Vec<String>,
+    found: Vec<Device>,
+    reply: Option<oneshot::Sender<Reply>>,
+}
+
+/// Looks the speakers up on the network. Missing ones are found later, when
+/// connecting.
+async fn resolve(reload: u64, speakers: Vec<String>, reply: Option<oneshot::Sender<Reply>>) -> Resolved {
+    let mut found = Vec::new();
+    if !speakers.is_empty() {
+        match discovery::scan(Duration::from_secs(3)).await {
+            Ok(scan) => found = scan.devices,
+            Err(e) => warn!("{e:#}"),
+        }
+    }
+    Resolved { reload, speakers: unique(speakers), found, reply }
+}
+
+/// Each speaker once, even if listed twice (names are case-insensitive).
+fn unique(mut speakers: Vec<String>) -> Vec<String> {
+    let mut seen = Vec::<String>::new();
+    speakers.retain(|name| {
+        let new = !seen.iter().any(|s| s.eq_ignore_ascii_case(name));
+        seen.push(name.clone());
+        new
+    });
+    speakers
+}
+
+/// The output's name in desktop sound settings.
+fn output_description(speakers: &[String]) -> String {
+    if speakers.is_empty() {
+        "AirPlay (no speaker selected)".into()
+    } else {
+        format!("AirPlay: {}", speakers.join(" + "))
+    }
 }
 
 #[derive(Default)]
@@ -205,36 +247,14 @@ struct NowPlaying {
     position: Option<(Duration, Instant)>,
 }
 
-/// Sets up the audio pipeline and runs the group until quit, Ctrl-C or SIGTERM.
-pub async fn run(
-    mut gc: GroupConfig,
-    store: Store,
-    mut console: mpsc::UnboundedReceiver<ConsoleCommand>,
-) -> Result<()> {
-    // Each speaker once, even if listed twice (names are case-insensitive).
-    let mut seen = Vec::<String>::new();
-    gc.speakers.retain(|name| {
-        let new = !seen.iter().any(|s| s.eq_ignore_ascii_case(name));
-        seen.push(name.clone());
-        new
-    });
+/// Sets up the audio pipeline and runs the group until `airpipe stop`,
+/// Ctrl-C or SIGTERM. `control` is bound first by the caller, so a second
+/// airpipe never gets this far.
+pub async fn run(gc: GroupConfig, store: Store, control: control::Server) -> Result<()> {
     let cfg = &gc.config;
-
     // Resolve speakers first: their settings decide the start-up volume, and
     // connecting on the first sound is faster when the address is known.
-    let mut members: Vec<Member> = gc.speakers.iter().cloned().map(Member::new).collect();
-    match discovery::scan(Duration::from_secs(3)).await {
-        Ok(found) => {
-            for m in members.iter_mut() {
-                m.device = found.devices.iter().find(|d| d.name.eq_ignore_ascii_case(&m.name)).cloned();
-                match &m.device {
-                    Some(d) => m.settings = store.device_settings(d)?,
-                    None => warn!("{}: not found on the network yet", m.name),
-                }
-            }
-        }
-        Err(e) => warn!("{e:#}"),
-    }
+    let resolved = resolve(0, cfg.output.speakers.clone(), None).await;
 
     // The ring holds up to 2 s; the jitter buffer keeps it near its target.
     let (producer, consumer) = rtrb::RingBuffer::<i16>::new(SAMPLE_RATE as usize * 2 * 2);
@@ -246,7 +266,7 @@ pub async fn run(
     let sink = Sink::start(
         SinkConfig {
             node_name: cfg.output.node_name.clone(),
-            description: format!("AirPlay: {}", gc.speakers.join(" + ")),
+            description: output_description(&resolved.speakers),
             latency: Duration::from_millis(latency_ms.into()) + jitter,
             forward_volume: cfg.volume.follow_system,
         },
@@ -269,31 +289,39 @@ pub async fn run(
 
     let (session_tx, mut session_rx) = mpsc::channel(64);
     let (connected_tx, mut connected_rx) = mpsc::unbounded_channel();
+    let (resolved_tx, mut resolved_rx) = mpsc::unbounded_channel();
+    let (mut requests, control_task) = control.spawn();
 
     let mut group = Group {
         gc,
         store,
         pipeline,
         sink,
-        members,
+        members: Vec::new(),
         session_tx,
         connected_tx,
+        resolved_tx,
         remote_tx,
         streaming_tx,
         system: None,
         start_level: None,
-        started: Instant::now(),
         last_audible_packets: 0,
         last_audio_at: None,
         now_playing: NowPlaying::default(),
         last_progress: Instant::now(),
+        attempts: 0,
+        reloads: 0,
     };
-    group.apply_start_volume();
+    group.on_resolved(resolved);
 
-    info!("ready: play something to the \"AirPlay: {}\" output", group.gc.speakers.join(" + "));
+    match group.members.len() {
+        0 => info!("ready, but no speaker selected: run `airpipe use <speaker>` (see `airpipe list`)"),
+        _ => info!("ready: play something to the {:?} output", output_description(&group.speaker_names())),
+    }
     // Ctrl-C in a terminal, SIGTERM from systemd: both end sessions cleanly.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut ticker = tokio::time::interval(TICK);
+    let mut stop_reply = None;
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -302,12 +330,14 @@ pub async fn run(
             Some(v) = volume_rx.recv() => group.on_volume(v),
             Some(ev) = session_rx.recv() => group.on_session(ev),
             Some(c) = connected_rx.recv() => group.on_connected(c),
+            Some(r) = resolved_rx.recv() => group.on_resolved(r),
             Some(ev) = media_rx.recv() => group.on_media(ev),
-            Some(cmd) = console.recv() => {
-                if matches!(cmd, ConsoleCommand::Quit) {
+            Some((request, reply)) = requests.recv() => {
+                if request == Request::Stop {
+                    stop_reply = Some(reply);
                     break;
                 }
-                group.on_console(cmd);
+                group.on_request(request, reply);
             }
         }
         group.manage_connections();
@@ -315,6 +345,14 @@ pub async fn run(
 
     info!("shutting down");
     group.release_all().await;
+    // Removes the output (giving the default output back) before answering
+    // `airpipe stop`, so the sound has moved when the command returns.
+    drop(group);
+    if let Some(reply) = stop_reply {
+        let _ = reply.send(Reply::ok("airpipe stopped"));
+    }
+    drop(requests);
+    let _ = control_task.await;
     Ok(())
 }
 
@@ -326,19 +364,24 @@ struct Group {
     members: Vec<Member>,
     session_tx: mpsc::Sender<SessionEvent>,
     connected_tx: mpsc::UnboundedSender<Connected>,
+    resolved_tx: mpsc::UnboundedSender<Resolved>,
     /// Speaker buttons to forward to MPRIS (None when metadata is disabled).
     remote_tx: Option<mpsc::Sender<RemoteCommand>>,
     /// Whether any speaker is streaming (MPRIS only polls while true).
     streaming_tx: watch::Sender<bool>,
     /// Last known system volume of our output.
     system: Option<SystemVolume>,
-    /// Slider level set at start-up, re-asserted during the start window.
-    start_level: Option<f32>,
-    started: Instant,
+    /// Slider level set by `apply_start_volume`, and when; re-asserted
+    /// during the start window.
+    start_level: Option<(f32, Instant)>,
     last_audible_packets: u64,
     last_audio_at: Option<Instant>,
     now_playing: NowPlaying,
     last_progress: Instant,
+    /// Connection attempts started so far.
+    attempts: u64,
+    /// Reloads requested so far; only the latest one is applied.
+    reloads: u64,
 }
 
 impl Group {
@@ -346,7 +389,7 @@ impl Group {
         VolumeInputs {
             settings: m.settings,
             gain_db: m.gain_db,
-            cap_db: self.gc.volume_cap_db,
+            cap: self.gc.volume_cap,
             follow_system: self.gc.config.volume.follow_system,
         }
     }
@@ -357,24 +400,34 @@ impl Group {
         }
     }
 
-    /// Puts the slider where the speakers play their sweet spot; with
-    /// several speakers, the lowest such position.
+    /// Puts the slider at the speakers' default volume (with several
+    /// speakers, the lowest): at start-up, and when speakers are added. Once
+    /// the desktop has reported a volume, it only ever lowers it, and keeps
+    /// mute.
     fn apply_start_volume(&mut self) {
         let v = &self.gc.config.volume;
-        if !v.follow_system || v.start != StartVolume::DeviceDefault {
+        if !v.follow_system || v.start != StartVolume::DeviceDefault || self.members.is_empty() {
             return;
         }
-        let level = self.members.iter().map(|m| self.volume_inputs(m).default_level()).fold(1.0f32, f32::min);
-        info!("setting output volume to {:.0}% (speakers' default levels)", level * 100.0);
+        let mut level = self.members.iter().map(|m| self.volume_inputs(m).default_level()).fold(1.0f32, f32::min);
+        let mut muted = false;
+        if let Some(now) = self.system {
+            if now.level <= level {
+                return;
+            }
+            level = level.min(now.level);
+            muted = now.muted;
+        }
+        info!("setting output volume to {:.0}% (the speakers' default volume)", level * 100.0);
         self.sink.set_level(level);
-        self.start_level = Some(level);
+        self.start_level = Some((level, Instant::now()));
         // PipeWire does not report a volume we set ourselves, so record it.
-        self.system = Some(SystemVolume { level, muted: false });
+        self.system = Some(SystemVolume { level, muted });
     }
 
     fn on_volume(&mut self, new: SystemVolume) {
-        if let Some(want) = self.start_level
-            && self.started.elapsed() < START_VOLUME_WINDOW
+        if let Some((want, at)) = self.start_level
+            && at.elapsed() < START_VOLUME_WINDOW
             && (new.level - want).abs() > 0.01
         {
             debug!("output volume restored to {:.0}%, re-applying {:.0}%", new.level * 100.0, want * 100.0);
@@ -418,9 +471,11 @@ impl Group {
 
     fn on_connected(&mut self, c: Connected) {
         let i = self.member_index(&c.name);
-        let Some(i) = i.filter(|&i| self.members[i].state == MemberState::Connecting) else {
-            // Removed or reset while connecting: drop the result. Dropping the
-            // session ends it; dropping the permit closes the timing port to it.
+        let current = |m: &Member| m.state == MemberState::Connecting && m.attempt == c.attempt;
+        let Some(i) = i.filter(|&i| current(&self.members[i])) else {
+            // Removed (perhaps re-added) or reset while connecting: drop the
+            // result. Dropping the session ends it; dropping the permit closes
+            // the timing port to it.
             return;
         };
         let (settings, session, permit) = match c.result {
@@ -483,52 +538,102 @@ impl Group {
         }
     }
 
-    /// Handles a console command (`Quit` is handled by the main loop).
-    fn on_console(&mut self, cmd: ConsoleCommand) {
-        match cmd {
-            ConsoleCommand::Quit => {}
-            ConsoleCommand::Status => self.print_status(),
-            ConsoleCommand::Gain { speaker, db } => {
-                let Some(i) = self.member_index(&speaker) else {
-                    return println!("no speaker {speaker:?} in this group");
-                };
-                let m = &mut self.members[i];
-                m.gain_db = db.clamp(MIN_DB, 0.0);
-                println!("{}: gain {:.1} dB (until restart; edit devices.toml to keep it)", m.name, m.gain_db);
-                self.send_volume(&self.members[i]);
-            }
-            ConsoleCommand::Reload => {
-                for i in 0..self.members.len() {
-                    let Some(d) = self.members[i].device.clone() else { continue };
-                    match self.store.device_settings(&d) {
-                        Ok(s) => {
-                            self.members[i].settings = s;
-                            self.send_volume(&self.members[i]);
-                            println!(
-                                "{}: max {:.1} dB, default {:.1} dB, offset {} ms",
-                                d.name, s.max_volume_db, s.default_volume_db, s.latency_offset_ms
-                            );
-                        }
-                        Err(e) => println!("{}: {e:#}", d.name),
-                    }
+    /// Handles a request from the control socket (`Stop` is handled by the
+    /// main loop).
+    fn on_request(&mut self, request: Request, reply: oneshot::Sender<Reply>) {
+        let answer = match request {
+            Request::Stop => return,
+            Request::Status => Reply::ok(self.status()),
+            Request::Gain { speaker, db } => match self.member_index(&speaker) {
+                None => {
+                    Reply::error(format!("{speaker:?} is not one of the speakers in use ({})", self.speaker_list()))
                 }
-                println!("volumes applied; latency offsets apply on the next connection");
-            }
-            ConsoleCommand::Add(name) => {
-                if self.member_index(&name).is_some() {
-                    println!("{name} is already in the group");
-                } else {
-                    println!("added {name}");
-                    self.members.push(Member::new(name));
+                Some(i) => {
+                    let m = &mut self.members[i];
+                    m.gain_db = db.clamp(MIN_DB, 0.0);
+                    let text = format!("{}: gain {:.1} dB until airpipe restarts", m.name, m.gain_db);
+                    self.send_volume(&self.members[i]);
+                    Reply::ok(text)
                 }
+            },
+            Request::Reload => match Config::load(&self.gc.config_path) {
+                Err(e) => Reply::error(format!("{e:#}")),
+                Ok(cfg) => {
+                    // Discovery takes a few seconds: answer when it is done.
+                    self.reloads += 1;
+                    let (tx, reload) = (self.resolved_tx.clone(), self.reloads);
+                    tokio::spawn(async move {
+                        let _ = tx.send(resolve(reload, cfg.output.speakers, Some(reply)).await);
+                    });
+                    return;
+                }
+            },
+        };
+        let _ = reply.send(answer);
+    }
+
+    /// Switches to a new speaker list: removed speakers are released, new
+    /// ones connect on the next sound, and every speaker's devices.toml
+    /// settings are re-read.
+    fn on_resolved(&mut self, r: Resolved) {
+        if r.reload != self.reloads {
+            // A newer reload (e.g. a quick `use` then `remove`) is in flight and wins.
+            if let Some(reply) = r.reply {
+                let _ = reply.send(Reply::ok("replaced by a newer change; `airpipe status` shows the result"));
             }
-            ConsoleCommand::Remove(name) => {
-                let Some(i) = self.member_index(&name) else {
-                    return println!("no speaker {name:?} in this group");
-                };
+            return;
+        }
+        let mut text = String::new();
+        let mut i = 0;
+        while i < self.members.len() {
+            if r.speakers.iter().any(|s| s.eq_ignore_ascii_case(&self.members[i].name)) {
+                i += 1;
+            } else {
                 self.release(i);
-                println!("removed {}", self.members.remove(i).name);
+                let _ = writeln!(text, "{}: removed", self.members.remove(i).name);
             }
+        }
+        let mut added = false;
+        for name in &r.speakers {
+            let i = self.member_index(name).unwrap_or_else(|| {
+                added = true;
+                self.members.push(Member::new(name.clone()));
+                self.members.len() - 1
+            });
+            let m = &mut self.members[i];
+            if m.session.is_none()
+                && let Some(d) = r.found.iter().find(|d| d.name.eq_ignore_ascii_case(name))
+            {
+                m.device = Some(d.clone());
+            }
+            match &m.device {
+                None => {
+                    let _ = writeln!(text, "{name}: not on the network right now; airpipe connects when it shows up");
+                }
+                Some(d) => match self.store.device_settings(d) {
+                    Ok(s) => m.settings = s,
+                    Err(e) => {
+                        let _ = writeln!(text, "{name}: {e:#}");
+                    }
+                },
+            }
+        }
+        self.sink.set_description(&output_description(&self.speaker_names()));
+        if added {
+            self.apply_start_volume();
+        }
+        for m in &self.members {
+            self.send_volume(m);
+        }
+        if let Some(reply) = r.reply {
+            match self.members.len() {
+                0 => text.push_str("no speaker selected: run `airpipe use <speaker>`\n"),
+                _ => {
+                    let _ = writeln!(text, "playing to: {}", self.speaker_list());
+                }
+            }
+            text.push_str(RELOAD_NOTE);
+            let _ = reply.send(Reply::ok(text));
         }
     }
 
@@ -566,8 +671,11 @@ impl Group {
     fn start_connect(&mut self, i: usize) {
         let inputs = self.volume_inputs(&self.members[i]);
         let system = self.system;
+        self.attempts += 1;
+        let attempt = self.attempts;
         let m = &mut self.members[i];
         m.state = MemberState::Connecting;
+        m.attempt = attempt;
         info!("{}: connecting", m.name);
         let name = m.name.clone();
         let known = m.device.clone();
@@ -587,7 +695,7 @@ impl Group {
                 Ok((settings, session, permit))
             }
             .await;
-            let _ = results.send(Connected { name, result });
+            let _ = results.send(Connected { name, attempt, result });
         });
     }
 
@@ -623,19 +731,32 @@ impl Group {
         self.members.iter().position(|m| m.name.eq_ignore_ascii_case(name))
     }
 
-    fn print_status(&self) {
+    fn speaker_names(&self) -> Vec<String> {
+        self.members.iter().map(|m| m.name.clone()).collect()
+    }
+
+    fn speaker_list(&self) -> String {
+        match self.members.len() {
+            0 => "none".into(),
+            _ => self.speaker_names().join(", "),
+        }
+    }
+
+    fn status(&self) -> String {
+        let mut out = String::new();
         let audio = match self.last_audio_at {
             Some(t) => format!("last audio {}s ago", t.elapsed().as_secs()),
             None => "no audio yet".into(),
         };
         let vol = match (self.gc.config.volume.follow_system, self.system) {
-            (false, _) => "fixed per-speaker levels (follow_system = false)".to_string(),
-            (true, Some(v)) => {
-                format!("system volume {:.0}%{}", v.level * 100.0, if v.muted { " (muted)" } else { "" })
-            }
-            (true, None) => "system volume not reported yet".to_string(),
+            (false, _) => "fixed per-speaker volumes (follow_system = false)".to_string(),
+            (true, Some(v)) => format!("volume {:.0}%{}", v.level * 100.0, if v.muted { " (muted)" } else { "" }),
+            (true, None) => "volume not reported by the desktop yet".to_string(),
         };
-        println!("{vol}, {audio}");
+        let _ = writeln!(out, "output {:?}: {vol}, {audio}", output_description(&self.speaker_names()));
+        if self.members.is_empty() {
+            out.push_str("no speaker selected: run `airpipe use <speaker>` (see `airpipe list`)\n");
+        }
         for m in &self.members {
             let state = match m.state {
                 MemberState::Idle => "idle".to_string(),
@@ -647,20 +768,28 @@ impl Group {
                 }
             };
             let v = self.volume_inputs(m);
+            let db = v.airplay_db(self.system);
+            let playing =
+                if db == MUTED_DB { "muted".to_string() } else { format!("{:.0}%", volume::db_to_level(db) * 100.0) };
             let addr = m.device.as_ref().map(|d| d.address.to_string()).unwrap_or_default();
-            println!(
-                "  {:<20} {:<12} {:>6.1} dB (max {:.1}, gain {:.1})  {addr}",
+            let _ = write!(
+                out,
+                "  {:<20} {:<24} {playing:>5} (default {:.0}%, max {:.0}%",
                 m.name,
                 state,
-                v.airplay_db(self.system),
-                v.ceiling(),
-                m.gain_db
+                m.settings.default_volume * 100.0,
+                v.ceiling_level() * 100.0
             );
+            if m.gain_db != 0.0 {
+                let _ = write!(out, ", gain {:.1} dB", m.gain_db);
+            }
+            let _ = writeln!(out, ")  {addr}");
             if let Some(e) = &m.last_error {
-                println!("  {:<20} last error: {e}", "");
+                let _ = writeln!(out, "  {:<20} last error: {e}", "");
             }
         }
-        println!("settings: {}", self.store.path().display());
+        let _ = write!(out, "settings: {} and {}", self.gc.config_path.display(), self.store.path().display());
+        out
     }
 }
 

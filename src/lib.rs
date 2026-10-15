@@ -9,16 +9,18 @@
 //! | [`airplay`] | Talking to one speaker: connection, pairing, session    | no    |
 //! | [`stream`]  | Real-time audio engine: pacing, packets, retransmits    | no    |
 //! | [`sink`]    | The PipeWire output device                              | no    |
+//! | [`default_output`] | Hands the default output back when airpipe quits | no    |
 //! | [`group`]   | Runs a group of speakers; [`group::volume`] rules       | no    |
 //! | [`discovery`] | Finding speakers through Avahi                        | no    |
 //! | [`mpris`]   | Now-playing info and remote control via MPRIS           | no    |
+//! | [`control`] | The control socket for `airpipe status`, `use`, `stop`… | no    |
 //! | [`config`]  | `config.toml` (global settings)                         | yes*  |
 //! | [`store`]   | `devices.toml` (device memory, keys)                    | no    |
 //! | [`random`]  | The single source of randomness                         | no    |
 //!
 //! "Pure" modules do no I/O and are unit-tested byte for byte.
-//! (*`config` parsing is pure; loading reads the file, and `run` creates the
-//! commented template on first use.)
+//! (*`config` parsing is pure; loading reads the file, `run` creates the
+//! commented template on first use, and `use` edits the speaker list.)
 //!
 //! # Where to start reading
 //!
@@ -30,7 +32,9 @@
 
 pub mod airplay;
 pub mod config;
+pub mod control;
 pub mod crypto;
+pub mod default_output;
 pub mod discovery;
 pub mod group;
 pub mod mpris;

@@ -14,8 +14,8 @@
 //! [devices."50:5B:C2:9C:79:E5"] # keyed by the speaker's deviceid
 //! name = "Bureau"
 //! model = "Devialet Phantom 103 dB"
-//! max_volume_db = -20.0
-//! default_volume_db = -26.0
+//! default_volume = 25          # % of the speaker's range, set at start-up
+//! max_volume = 100             # % cap (100 = none)
 //! latency_offset_ms = 0
 //!
 //! [devices."50:5B:C2:9C:79:E5".pairing]   # only after `airpipe pair`
@@ -36,7 +36,6 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::crypto::pairing::{DeviceKeys, Identity};
 use crate::discovery::Device;
-use crate::group::volume::MIN_DB;
 
 const FILE_NAME: &str = "devices.toml";
 
@@ -45,25 +44,36 @@ const HEADER: &str = "\
 # One entry per AirPlay target as discovered on the network: a stereo pair or a
 # vendor multi-room setup that shows up as a single target is a single entry.
 # You may edit per-speaker settings; your edits and comments are kept.
-# Volumes are AirPlay dB: -30 is the quietest step, 0 is the speaker's FULL power.
-#   max_volume_db      sent when the system volume is at 100% (hard ceiling)
-#   default_volume_db  level at start-up, and when not following system volume
+# Volumes are percentages of the speaker's full range (100 = its FULL power),
+# the same scale as your system volume slider.
+#   default_volume     volume set at start-up (and used when not following the
+#                      system volume): low for powerful speakers, higher for quiet ones
+#   max_volume         hard cap; airpipe never plays this speaker louder
+#                      (100 = no cap, 0 = silent)
 #   latency_offset_ms  delay this speaker (-250..1000) to line up multi-room groups
 # This file contains a secret key: keep it private (mode 0600).
 ";
 
-/// Per-speaker settings, with defaults chosen by model.
+/// Per-speaker settings, with defaults chosen by model. Volumes are slider
+/// positions (0.0..=1.0 of the speaker's range); devices.toml stores percents.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeviceSettings {
-    /// AirPlay dB sent when the system volume is at 100%. Nothing above is sent.
-    pub max_volume_db: f32,
     /// Start-up level, and the fixed level when not following system volume.
-    pub default_volume_db: f32,
+    pub default_volume: f32,
+    /// Hard cap. 1.0 = no cap (the speaker's maximum).
+    pub max_volume: f32,
     /// Extra delay for this speaker, to line up a multi-room group.
     pub latency_offset_ms: i32,
 }
 
-/// Speakers known to be very loud get a lower ceiling and starting point.
+/// Keys used before 0.2 (AirPlay dB), each with its new key and the values
+/// airpipe wrote itself back then (the old model defaults). Those are
+/// replaced by the new defaults; a value the user chose is converted, so a
+/// deliberate limit survives the upgrade.
+const OLD_KEYS: [(&str, &str, [f64; 2]); 2] =
+    [("max_volume_db", "max_volume", [-20.0, -10.0]), ("default_volume_db", "default_volume", [-26.0, -20.0])];
+
+/// Speakers known to be very loud start lower.
 /// Matched case-insensitively as substrings of "manufacturer model " (note
 /// the trailing space, so that "kef " matches a whole word, not "kefir").
 const HIGH_OUTPUT: &[&str] = &["devialet", "bang & olufsen", "mcintosh", "klipsch", "kef "];
@@ -74,22 +84,22 @@ impl DeviceSettings {
         if HIGH_OUTPUT.iter().any(|m| id.contains(m)) {
             Self::conservative()
         } else {
-            Self { max_volume_db: -10.0, default_volume_db: -20.0, latency_offset_ms: 0 }
+            // TVs, soundbars and small speakers: a comfortable middle.
+            Self { default_volume: 0.50, max_volume: 1.0, latency_offset_ms: 0 }
         }
     }
 
     /// Used for high-output speakers, and for speakers not resolved yet.
     pub fn conservative() -> Self {
-        Self { max_volume_db: -20.0, default_volume_db: -26.0, latency_offset_ms: 0 }
+        Self { default_volume: 0.25, max_volume: 1.0, latency_offset_ms: 0 }
     }
 
     /// Brings hand-edited values into range. Non-numbers (`nan`, `inf`) fall
     /// back to the model defaults rather than reaching the volume code.
     fn sanitized(mut self, defaults: Self) -> Self {
         let finite = |v: f32, d: f32| if v.is_finite() { v } else { d };
-        self.max_volume_db = finite(self.max_volume_db, defaults.max_volume_db).clamp(MIN_DB, 0.0);
-        self.default_volume_db =
-            finite(self.default_volume_db, defaults.default_volume_db).clamp(MIN_DB, self.max_volume_db);
+        self.max_volume = finite(self.max_volume, defaults.max_volume).clamp(0.0, 1.0);
+        self.default_volume = finite(self.default_volume, defaults.default_volume).clamp(0.0, self.max_volume);
         let offsets = crate::config::LATENCY_OFFSET_MS_RANGE;
         self.latency_offset_ms = self.latency_offset_ms.clamp(*offsets.start(), *offsets.end());
         self
@@ -167,10 +177,19 @@ impl Store {
         let mut changed = false;
         let fresh: [(&str, Item); 4] = [
             ("model", value(model)),
-            ("max_volume_db", value(defaults.max_volume_db as f64)),
-            ("default_volume_db", value(defaults.default_volume_db as f64)),
+            ("default_volume", value(percent(defaults.default_volume))),
+            ("max_volume", value(percent(defaults.max_volume))),
             ("latency_offset_ms", value(defaults.latency_offset_ms as i64)),
         ];
+        for (old, new, written_by_airpipe) in OLD_KEYS {
+            let Some(item) = entry.remove(old) else { continue };
+            changed = true;
+            if let Some(level) = old_level(&item, written_by_airpipe)
+                && !entry.contains_key(new)
+            {
+                entry.insert(new, value(percent(level)));
+            }
+        }
         // The display name follows the speaker; the rest is only filled in.
         if entry.get("name").and_then(Item::as_str) != Some(device.name.as_str()) {
             entry.insert("name", value(device.name.as_str()));
@@ -191,8 +210,8 @@ impl Store {
                 .unwrap_or(d)
         };
         let settings = DeviceSettings {
-            max_volume_db: num("max_volume_db", defaults.max_volume_db),
-            default_volume_db: num("default_volume_db", defaults.default_volume_db),
+            default_volume: num("default_volume", defaults.default_volume * 100.0) / 100.0,
+            max_volume: num("max_volume", defaults.max_volume * 100.0) / 100.0,
             latency_offset_ms: entry
                 .get("latency_offset_ms")
                 .and_then(Item::as_integer)
@@ -290,20 +309,36 @@ impl Store {
 fn inherit_lower_limits(doc: &DocumentMut, name: &str, mut defaults: DeviceSettings) -> DeviceSettings {
     let Some(devices) = doc.get("devices").and_then(Item::as_table) else { return defaults };
     let num = |entry: &Item, key: &str| {
-        entry.get(key).and_then(|i| i.as_float().or_else(|| i.as_integer().map(|n| n as f64))).map(|v| v as f32)
+        entry.get(key).and_then(|i| i.as_float().or_else(|| i.as_integer().map(|n| n as f64))).map(|v| v as f32 / 100.0)
     };
     for (_, entry) in devices.iter() {
         if !entry.get("name").and_then(Item::as_str).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
             continue;
         }
-        if let Some(max) = num(entry, "max_volume_db").filter(|v| v.is_finite()) {
-            defaults.max_volume_db = defaults.max_volume_db.min(max);
+        // An entry not migrated yet (from before 0.2) has the old dB keys.
+        let [(_, _, max_auto), (_, _, default_auto)] = OLD_KEYS;
+        let old_max = entry.get("max_volume_db").and_then(|i| old_level(i, max_auto));
+        let old_default = entry.get("default_volume_db").and_then(|i| old_level(i, default_auto));
+        if let Some(max) = num(entry, "max_volume").or(old_max).filter(|v| v.is_finite()) {
+            defaults.max_volume = defaults.max_volume.min(max);
         }
-        if let Some(default) = num(entry, "default_volume_db").filter(|v| v.is_finite()) {
-            defaults.default_volume_db = defaults.default_volume_db.min(default);
+        if let Some(default) = num(entry, "default_volume").or(old_default).filter(|v| v.is_finite()) {
+            defaults.default_volume = defaults.default_volume.min(default);
         }
     }
     defaults
+}
+
+/// The slider position for an old (before 0.2) dB value, unless it is one
+/// airpipe wrote itself.
+fn old_level(item: &Item, written_by_airpipe: [f64; 2]) -> Option<f32> {
+    let db = item.as_float().or_else(|| item.as_integer().map(|n| n as f64))?;
+    (db.is_finite() && !written_by_airpipe.contains(&db)).then(|| crate::group::volume::db_to_level(db as f32))
+}
+
+/// A slider position as a whole percentage for devices.toml.
+fn percent(level: f32) -> i64 {
+    (level * 100.0).round() as i64
 }
 
 fn set_controller(doc: &mut DocumentMut, id: &LocalIdentity) {
@@ -335,7 +370,7 @@ fn device_table<'a>(doc: &'a mut DocumentMut, device_id: &str) -> &'a mut Table 
 }
 
 /// Atomically writes a file readable only by the current user.
-fn write_private(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -394,13 +429,14 @@ mod tests {
         let dir = temp_dir();
         let store = Store::open(dir.clone());
         let loud = store.device_settings(&device("Bureau", "Devialet", "Phantom 103 dB")).unwrap();
-        assert_eq!(loud.max_volume_db, -20.0);
-        assert_eq!(loud.default_volume_db, -26.0);
+        assert_eq!(loud.default_volume, 0.25);
+        assert_eq!(loud.max_volume, 1.0);
         let plain = store.device_settings(&device("Kitchen", "Sonos", "One")).unwrap();
-        assert_eq!(plain.max_volume_db, -10.0);
+        assert_eq!(plain.default_volume, 0.5);
         let text = fs::read_to_string(store.path()).unwrap();
         assert!(text.contains("ID-Bureau"), "{text}");
         assert!(text.contains("model = \"Devialet Phantom 103 dB\""), "{text}");
+        assert!(text.contains("default_volume = 25"), "{text}");
         assert!(text.starts_with("# airpipe device memory"), "{text}");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -415,24 +451,24 @@ mod tests {
 
         let original = fs::read_to_string(store.path()).unwrap();
         let edited = original
-            .replace("max_volume_db = -20.0", "max_volume_db = -15.0 # louder in the office")
+            .replace("max_volume = 100", "max_volume = 60 # quieter in the office")
             .replace("latency_offset_ms = 0", "latency_offset_ms = 40");
         assert_ne!(original, edited, "edit applied:\n{original}");
         fs::write(store.path(), edited).unwrap();
 
         let s = store.device_settings(&dev).unwrap();
-        assert_eq!(s.max_volume_db, -15.0);
+        assert_eq!(s.max_volume, 0.6);
         assert_eq!(s.latency_offset_ms, 40);
 
         let keys = DeviceKeys { accessory_id: "acc".into(), accessory_public_key: [3u8; 32] };
         store.save_device_keys(&dev.device_id, &dev.name, &keys).unwrap();
         assert_eq!(store.device_keys(&dev.device_id).unwrap(), Some(keys));
         let text = fs::read_to_string(store.path()).unwrap();
-        assert!(text.contains("# louder in the office"), "comment kept:\n{text}");
+        assert!(text.contains("# quieter in the office"), "comment kept:\n{text}");
 
         assert!(store.remove_device_keys(&dev.device_id).unwrap());
         assert!(!store.remove_device_keys(&dev.device_id).unwrap());
-        assert_eq!(store.device_settings(&dev).unwrap().max_volume_db, -15.0, "settings kept after unpair");
+        assert_eq!(store.device_settings(&dev).unwrap().max_volume, 0.6, "settings kept after unpair");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -442,35 +478,69 @@ mod tests {
         let store = Store::open(dir.clone());
         let old = device("Kitchen", "Sonos", "One");
         store.device_settings(&old).unwrap();
-        let lowered =
-            fs::read_to_string(store.path()).unwrap().replace("max_volume_db = -10.0", "max_volume_db = -24.0");
+        let lowered = fs::read_to_string(store.path()).unwrap().replace("max_volume = 100", "max_volume = 30");
         fs::write(store.path(), lowered).unwrap();
 
         let mut moved = device("Kitchen", "Sonos", "One");
         moved.device_id = "NEW-ID".into();
         let s = store.device_settings(&moved).unwrap();
-        assert_eq!(s.max_volume_db, -24.0, "the user's lower ceiling carries over");
+        assert_eq!(s.max_volume, 0.3, "the user's lower cap carries over");
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn out_of_range_values_are_clamped() {
         let d = DeviceSettings::conservative();
-        let s = DeviceSettings { max_volume_db: 6.0, default_volume_db: 3.0, latency_offset_ms: 99_999 }.sanitized(d);
-        assert_eq!(s.max_volume_db, 0.0);
-        assert_eq!(s.default_volume_db, 0.0);
+        let s = DeviceSettings { default_volume: 3.0, max_volume: 6.0, latency_offset_ms: 99_999 }.sanitized(d);
+        assert_eq!(s.max_volume, 1.0);
+        assert_eq!(s.default_volume, 1.0);
         assert_eq!(s.latency_offset_ms, 1000);
-        let s = DeviceSettings { max_volume_db: -25.0, default_volume_db: -10.0, latency_offset_ms: 0 }.sanitized(d);
-        assert_eq!(s.default_volume_db, -25.0, "default never above the ceiling");
+        let s = DeviceSettings { default_volume: 0.8, max_volume: 0.3, latency_offset_ms: 0 }.sanitized(d);
+        assert_eq!(s.default_volume, 0.3, "default never above the cap");
+        let s = DeviceSettings { default_volume: -1.0, max_volume: 1.0, latency_offset_ms: 0 }.sanitized(d);
+        assert_eq!(s.default_volume, 0.0);
     }
 
     #[test]
     fn non_numbers_fall_back_to_defaults() {
         let d = DeviceSettings::conservative();
-        let s = DeviceSettings { max_volume_db: f32::NAN, default_volume_db: f32::INFINITY, latency_offset_ms: 0 }
-            .sanitized(d);
-        assert_eq!(s.max_volume_db, d.max_volume_db);
-        assert_eq!(s.default_volume_db, d.default_volume_db);
+        let s =
+            DeviceSettings { default_volume: f32::INFINITY, max_volume: f32::NAN, latency_offset_ms: 0 }.sanitized(d);
+        assert_eq!(s.max_volume, d.max_volume);
+        assert_eq!(s.default_volume, d.default_volume);
+    }
+
+    #[test]
+    fn old_db_keys_are_replaced() {
+        let dir = temp_dir();
+        let store = Store::open(dir.clone());
+        let dev = device("Bureau", "Devialet", "Phantom");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            store.path(),
+            "[devices.\"ID-Bureau\"]\nname = \"Bureau\"\nmax_volume_db = -20.0\ndefault_volume_db = -26.0\n",
+        )
+        .unwrap();
+        let s = store.device_settings(&dev).unwrap();
+        assert_eq!(s.default_volume, 0.25);
+        let text = fs::read_to_string(store.path()).unwrap();
+        assert!(!text.contains("_db"), "{text}");
+        assert!(text.contains("max_volume = 100"), "airpipe's old ceiling is dropped: {text}");
+
+        // Values the user chose are converted, not dropped.
+        fs::write(
+            store.path(),
+            "[devices.\"ID-Bureau\"]\nname = \"Bureau\"\nmax_volume_db = -24.0\ndefault_volume_db = -27\n",
+        )
+        .unwrap();
+        let s = store.device_settings(&dev).unwrap();
+        assert_eq!((s.max_volume, s.default_volume), (0.2, 0.1));
+
+        // ...also when the speaker comes back under a new device id.
+        fs::write(store.path(), "[devices.\"OLD-ID\"]\nname = \"Bureau\"\nmax_volume_db = -24.0\n").unwrap();
+        let s = store.device_settings(&dev).unwrap();
+        assert_eq!(s.max_volume, 0.2);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
