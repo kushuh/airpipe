@@ -44,6 +44,14 @@ pub fn db_to_level(db: f32) -> f32 {
     ((db - MIN_DB) / -MIN_DB).clamp(0.0, 1.0)
 }
 
+/// A value a hair below `db` (0.01 dB, inaudible), to make a speaker see a
+/// real change before `db` is sent again. None when muted, or when it would
+/// go below the quietest step (some speakers treat that as mute).
+pub fn nudged_below(db: f32) -> Option<f32> {
+    let nudged = db - 0.01;
+    (db > MUTED_DB && nudged >= MIN_DB).then_some(nudged)
+}
+
 /// Everything that decides one speaker's volume.
 #[derive(Debug, Clone, Copy)]
 pub struct VolumeInputs {
@@ -139,6 +147,13 @@ mod tests {
         assert!(v.airplay_db(sys(1.0)) <= 0.0);
         v.settings.max_volume = 0.0;
         assert_eq!(v.airplay_db(sys(1.0)), MUTED_DB, "a cap of 0 is silence, not the quietest step");
+    }
+
+    #[test]
+    fn nudge_is_tiny_lower_and_never_mutes() {
+        assert_eq!(nudged_below(-15.0), Some(-15.01));
+        assert_eq!(nudged_below(MIN_DB), None);
+        assert_eq!(nudged_below(MUTED_DB), None);
     }
 
     #[test]

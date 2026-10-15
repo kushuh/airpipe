@@ -161,6 +161,13 @@ before you hear it, and how much Wi-Fi trouble it can absorb:
 
 Video players compensate for the delay automatically.
 
+For less delay, set an exact value, from 1 to 10000 ms, e.g.
+`latency_ms = 200`. AirPlay always buffers on the speaker. This buffer
+absorbs Wi-Fi hiccups and keeps several speakers in sync, so near-instant
+sound like a wired speaker is not possible. Go down step by step: below
+about 250 ms, sound cuts out unless your network is excellent, and some
+speakers keep their own minimum delay whatever you set.
+
 ### `devices.toml`: one entry per speaker
 
 airpipe adds each speaker the first time it plays to it. You can edit the

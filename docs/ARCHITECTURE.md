@@ -242,12 +242,22 @@ cushion, the buffer skips ahead so latency stays bounded.
   speakers' `default_volume` (the lowest across the group). WirePlumber may
   restore a remembered volume onto the new node right after start-up, so
   airpipe re-asserts its level for the first 3 seconds.
+* Some speakers (seen on Devialet after standby) play at their own level
+  once audio starts, while still reporting ours, until the volume changes.
+  Each session therefore re-sends its volume 0.5 s and 2.5 s after the first
+  sound, preceded by a value 0.01 dB lower (`volume::nudged_below`), so the
+  speaker sees real changes.
 
 ### Latency reporting
 
 The sink announces `ProcessLatency = latency + jitter cushion` to PipeWire.
 Players that do A/V sync (mpv, browsers, GStreamer) read it through the
 graph's latency reporting and delay video accordingly.
+
+Below the low-latency preset (`latency_ms` < 500), our own cushion drops to
+1024 frames (about one PipeWire quantum), and the speaker is told it may
+buffer as little as the chosen latency (`latencyMin`), instead of the usual
+250 ms.
 
 ## Persistent state
 
