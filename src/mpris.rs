@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
-use zbus::zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 use crate::airplay::events::RemoteCommand;
 use crate::proto::dmap::TrackInfo;
@@ -58,9 +58,9 @@ struct Snapshot {
 /// A player proxy without property caching: one D-Bus call per read.
 async fn player(conn: &zbus::Connection, name: &str) -> zbus::Result<zbus::Proxy<'static>> {
     zbus::proxy::Builder::<zbus::Proxy>::new(conn)
-        .destination(name.to_owned())?
-        .path(PATH)?
-        .interface(IFACE_PLAYER)?
+        .destination(name.to_owned())
+        .path(PATH)
+        .interface(IFACE_PLAYER)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
@@ -154,7 +154,7 @@ async fn poll(
         *current_player = Some(name);
     }
 
-    let Ok(metadata) = proxy.get_property::<HashMap<String, OwnedValue>>("Metadata").await else { return Ok(()) };
+    let Ok(metadata) = proxy.get_property::<HashMap<String, OwnedVariant>>("Metadata").await else { return Ok(()) };
     let snapshot = snapshot(&metadata);
     if last.as_ref() != Some(&snapshot) {
         let artwork = match &snapshot.art_url {
@@ -170,11 +170,11 @@ async fn poll(
     Ok(())
 }
 
-fn string(v: &OwnedValue) -> Option<String> {
+fn string(v: &OwnedVariant) -> Option<String> {
     String::try_from(v.try_clone().ok()?).ok().filter(|s| !s.is_empty())
 }
 
-fn snapshot(md: &HashMap<String, OwnedValue>) -> Snapshot {
+fn snapshot(md: &HashMap<String, OwnedVariant>) -> Snapshot {
     let artist = md
         .get("xesam:artist")
         .and_then(|v| Vec::<String>::try_from(v.try_clone().ok()?).ok())
@@ -265,20 +265,20 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zbus::zvariant::Value;
+    use zbus::Variant;
 
-    fn ov(v: Value<'static>) -> OwnedValue {
-        OwnedValue::try_from(v).unwrap()
+    fn ov(v: Variant<'static>) -> OwnedVariant {
+        OwnedVariant::try_from(v).unwrap()
     }
 
     #[test]
     fn metadata_snapshot() {
         let mut md = HashMap::new();
-        md.insert("xesam:title".to_string(), ov(Value::from("Song")));
-        md.insert("xesam:artist".to_string(), ov(Value::from(vec!["A".to_string(), "B".to_string()])));
-        md.insert("xesam:album".to_string(), ov(Value::from("")));
-        md.insert("mpris:length".to_string(), ov(Value::from(180_000_000i64)));
-        md.insert("mpris:artUrl".to_string(), ov(Value::from("file:///tmp/a%20b.jpg")));
+        md.insert("xesam:title".to_string(), ov(Variant::from("Song")));
+        md.insert("xesam:artist".to_string(), ov(Variant::from(vec!["A".to_string(), "B".to_string()])));
+        md.insert("xesam:album".to_string(), ov(Variant::from("")));
+        md.insert("mpris:length".to_string(), ov(Variant::from(180_000_000i64)));
+        md.insert("mpris:artUrl".to_string(), ov(Variant::from("file:///tmp/a%20b.jpg")));
         let s = snapshot(&md);
         assert_eq!(s.info.title.as_deref(), Some("Song"));
         assert_eq!(s.info.artist.as_deref(), Some("A, B"));
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn unsigned_length_is_accepted() {
         let mut md = HashMap::new();
-        md.insert("mpris:length".to_string(), ov(Value::from(5_000_000u64)));
+        md.insert("mpris:length".to_string(), ov(Variant::from(5_000_000u64)));
         assert_eq!(snapshot(&md).length, Some(Duration::from_secs(5)));
     }
 
