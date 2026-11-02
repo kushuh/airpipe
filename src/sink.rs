@@ -9,8 +9,10 @@
 //!   (`softVolumes` forced to 1.0). They are forwarded to the speakers as
 //!   AirPlay volume instead, which keeps full resolution on the wire.
 //!   (With `forward_volume = false`, PipeWire scales samples as usual.)
-//! * The AirPlay latency is reported as `ProcessLatency`, so players that do
-//!   A/V sync (video players, browsers) delay video accordingly.
+//! * The delay until the speakers play a sample is reported as the input
+//!   port's `Latency` (and as `ProcessLatency`), and updated when it changes,
+//!   so players that do A/V sync (video players, browsers) delay video
+//!   accordingly.
 //!
 //! * The output is renamed when the speakers change, and on quit the
 //!   previous default output is given back (`default_output.rs`) before the
@@ -40,6 +42,8 @@ enum ToSink {
     SetLevel(f32),
     /// Rename the output (shown in desktop sound settings).
     SetDescription(String),
+    /// Report a new latency (see `SinkConfig::latency`).
+    SetLatency(std::time::Duration),
     /// Hand the default output back, then stop.
     Quit,
     /// Stop now (sent if PipeWire does not confirm `Quit` in time).
@@ -54,7 +58,8 @@ pub struct Sink {
 pub struct SinkConfig {
     pub node_name: String,
     pub description: String,
-    /// End-to-end latency to report to PipeWire (AirPlay latency + jitter cushion).
+    /// Delay from this output to the speakers' sound, reported to PipeWire
+    /// (see `group::output_latency`).
     pub latency: std::time::Duration,
     /// Forward the user's volume to the speakers instead of scaling samples.
     /// When false, PipeWire applies the volume digitally as for any device.
@@ -102,6 +107,11 @@ impl Sink {
     pub fn set_description(&self, description: &str) {
         let _ = self.tx.send(ToSink::SetDescription(description.to_string()));
     }
+
+    /// Reports a new latency, e.g. when the speakers' offsets change.
+    pub fn set_latency(&self, latency: std::time::Duration) {
+        let _ = self.tx.send(ToSink::SetLatency(latency));
+    }
 }
 
 impl Drop for Sink {
@@ -142,12 +152,35 @@ fn format_param() -> Vec<u8> {
     }))
 }
 
-fn latency_param(ns: i64) -> Vec<u8> {
-    serialize(&Value::Object(Object {
+/// The latency of our input port, which players see, and the same value as
+/// `ProcessLatency`. A stream's `ProcessLatency` alone does not reach its
+/// ports (observed on PipeWire 1.6: players measured only the graph's
+/// ~30 ms), so this publishes both, like PipeWire's own RTP and RAOP sinks
+/// (`module-rtp/stream.c`).
+fn latency_params(latency: std::time::Duration) -> [Vec<u8>; 2] {
+    let ns = latency.as_nanos() as i64;
+    let port = serialize(&Value::Object(Object {
+        type_: spa_sys::SPA_TYPE_OBJECT_ParamLatency,
+        id: spa_sys::SPA_PARAM_Latency,
+        properties: vec![
+            Property::new(
+                spa_sys::SPA_PARAM_LATENCY_direction,
+                Value::Id(spa::utils::Id(spa_sys::SPA_DIRECTION_INPUT)),
+            ),
+            Property::new(spa_sys::SPA_PARAM_LATENCY_minQuantum, Value::Float(0.0)),
+            Property::new(spa_sys::SPA_PARAM_LATENCY_maxQuantum, Value::Float(0.0)),
+            Property::new(spa_sys::SPA_PARAM_LATENCY_minRate, Value::Int(0)),
+            Property::new(spa_sys::SPA_PARAM_LATENCY_maxRate, Value::Int(0)),
+            Property::new(spa_sys::SPA_PARAM_LATENCY_minNs, Value::Long(ns)),
+            Property::new(spa_sys::SPA_PARAM_LATENCY_maxNs, Value::Long(ns)),
+        ],
+    }));
+    let process = serialize(&Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_ParamProcessLatency,
         id: spa_sys::SPA_PARAM_ProcessLatency,
         properties: vec![Property::new(spa_sys::SPA_PARAM_PROCESS_LATENCY_ns, Value::Long(ns))],
-    }))
+    }));
+    [port, process]
 }
 
 /// User-visible volume state extracted from a Props param.
@@ -200,9 +233,14 @@ fn passthrough_props(channels: usize, channel_volume: Option<f32>) -> Vec<u8> {
     }))
 }
 
+/// Our own serialized params are always valid pods.
+fn as_pod(bytes: &[u8]) -> &Pod {
+    Pod::from_bytes(bytes).expect("valid pod")
+}
+
 /// Applies a Props param to the stream.
 fn set_props(stream: &pw::stream::Stream, bytes: &[u8]) {
-    let pod = Pod::from_bytes(bytes).expect("valid pod");
+    let pod = as_pod(bytes);
     // SAFETY: the stream pointer is valid while we hold `stream`, and the pod
     // outlives the call, which copies it.
     let res = unsafe { pw::sys::pw_stream_set_param(stream.as_raw_ptr(), spa_sys::SPA_PARAM_Props, pod.as_raw_ptr()) };
@@ -304,8 +342,8 @@ fn run(
         .register()?;
 
     let format = format_param();
-    let latency = latency_param(cfg.latency.as_nanos() as i64);
-    let mut params = [Pod::from_bytes(&format).expect("valid pod"), Pod::from_bytes(&latency).expect("valid pod")];
+    let [port_latency, process_latency] = latency_params(cfg.latency);
+    let mut params = [as_pod(&format), as_pod(&port_latency), as_pod(&process_latency)];
     stream.connect(
         spa::utils::Direction::Input,
         None,
@@ -339,6 +377,12 @@ fn run(
                 let res = unsafe { pw::sys::pw_stream_update_properties(stream.as_raw_ptr(), &props.as_raw().dict) };
                 if res < 0 {
                     warn!("could not rename the output ({res})");
+                }
+            }
+            ToSink::SetLatency(latency) => {
+                let [port, process] = latency_params(latency);
+                if let Err(e) = stream.update_params(&mut [as_pod(&port), as_pod(&process)]) {
+                    warn!("could not update the output's latency: {e}");
                 }
             }
             ToSink::Quit => {
