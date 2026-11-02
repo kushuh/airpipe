@@ -128,6 +128,13 @@ airpipe asks the Avahi daemon over D-Bus: its warm cache answers instantly,
 whereas a fresh mDNS client must wait for speakers to reply. airpipe only
 browses. It never registers a service.
 
+mDNS cannot tell whether a receiver answers. Avahi keeps speakers that were
+turned off for a while, and a hung receiver keeps advertising itself
+(observed on a Devialet Phantom: it accepts connections but never answers).
+So `airpipe list` also sends `GET /info` to each speaker on a LAN address,
+16 at a time, allowing 3 s to connect and 3 s to answer. A speaker that
+connects but does not answer is reported as `connection::NotAnswering`.
+
 ### Session setup (`airplay/session.rs`)
 
 ```
@@ -242,11 +249,13 @@ cushion, the buffer skips ahead so latency stays bounded.
   speakers' `default_volume` (the lowest across the group). WirePlumber may
   restore a remembered volume onto the new node right after start-up, so
   airpipe re-asserts its level for the first 3 seconds.
-* Some speakers (seen on Devialet after standby) play at their own level
-  once audio starts, while still reporting ours, until the volume changes.
-  Each session therefore re-sends its volume 0.5 s and 2.5 s after the first
-  sound, preceded by a value 0.01 dB lower (`volume::nudged_below`), so the
-  speaker sees real changes.
+* A session sends the volume during setup, then only when it changes
+  (`SessionHandle::set_volume`). It never re-sends on a timer. airpipe
+  0.2.1 re-sent it 0.5 s and 2.5 s after the first sound (0.01 dB lower,
+  then ours), to fix a Devialet playing at its own level after standby,
+  which was never confirmed. On a Devialet Phantom, 3 of about 1000
+  sessions hung the speaker's AirPlay receiver at one of those re-sends,
+  until it was power-cycled.
 
 ### Latency reporting
 

@@ -225,6 +225,13 @@ on some speakers. So:
   [Firewall](#firewall)).
 * Run `airpipe status` to see errors.
 
+**"speaker accepts connections but does not answer"**
+
+The speaker's AirPlay receiver has hung. It still shows up in
+`airpipe list` and in other devices' AirPlay menus, but it answers no one.
+Turn the speaker off and on (at the power switch, or unplug it).
+airpipe reconnects by itself within a minute, or on the next sound.
+
 **Sound cuts out**
 
 Set `latency = "robust"` in `config.toml`. Wi-Fi interference is the usual
