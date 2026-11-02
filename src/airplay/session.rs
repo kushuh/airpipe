@@ -30,7 +30,7 @@ use crate::config::MIN_SPEAKER_BUFFER_MS;
 use crate::crypto::channel::{Channel, ChannelCipher};
 use crate::crypto::pairing::DeviceKeys;
 use crate::discovery::{Device, status};
-use crate::group::volume::{MUTED_DB, nudged_below};
+use crate::group::volume::MUTED_DB;
 use crate::proto::dmap::{self, TrackInfo};
 use crate::proto::rtp::{FRAMES_PER_PACKET, SAMPLE_RATE};
 use crate::proto::rtsp::{Message, Request};
@@ -50,8 +50,6 @@ impl Drop for AbortOnDrop {
 
 /// Interval of `POST /feedback` keepalives (what macOS uses).
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
-/// When to re-send the volume, counted from the first sound at the speaker.
-const REASSERT_AFTER: [Duration; 2] = [Duration::from_millis(500), Duration::from_millis(2500)];
 
 /// Everything a session needs that is shared by the whole group.
 #[derive(Clone)]
@@ -147,9 +145,10 @@ impl SessionHandle {
     }
 
     /// Sets the AirPlay volume in dB. Only the latest value is kept and it is
-    /// always delivered, ahead of any queued metadata.
+    /// always delivered, ahead of any queued metadata. The same value again
+    /// is not re-sent.
     pub fn set_volume(&self, db: f32) {
-        self.volume.send_replace(db);
+        self.volume.send_if_modified(|v| std::mem::replace(v, db) != db);
     }
 
     /// Ends the session, waiting at most 3 s for the speaker to acknowledge.
@@ -229,7 +228,7 @@ pub async fn start(
     let mut conn = Connection::connect(device.address, headers).await?;
 
     // 1. Status flags.
-    let info = conn.request_ok(Request::new("GET", "/info")).await?;
+    let info = conn.info().await?;
     let flags = plist_dict(&info).ok().and_then(|d| uint(&d, "statusFlags")).unwrap_or(device.flags);
     if flags & status::RECEIVER_BUSY != 0 {
         warn!("{}: reports busy; it may refuse the stream", device.name);
@@ -335,8 +334,7 @@ pub async fn start(
     let (volume, volume_rx) = watch::channel(initial_volume);
     let (done, finished) = oneshot::channel();
     tokio::spawn(async move {
-        let first_sound = Duration::from_secs_f64(f64::from(ctx.latency_frames) / f64::from(SAMPLE_RATE));
-        actor(conn, url, id, rx, volume_rx, events, first_sound).await;
+        actor(conn, url, id, rx, volume_rx, events).await;
         drop(event_task); // the session is over; stop listening to the speaker
         let _ = done.send(());
     });
@@ -346,6 +344,12 @@ pub async fn start(
 /// Serves one session until its handle is dropped (then sends TEARDOWN) or
 /// the connection fails. Volume changes come first: the latest value is
 /// sent before any queued metadata.
+///
+/// The volume is sent during setup, then only when it changes. Never re-send
+/// it on a timer: airpipe 0.2.1 re-sent it 0.5 s and 2.5 s after the first
+/// sound (0.01 dB lower, then the real value). On a Devialet Phantom, 3 of
+/// about 1000 sessions hung the speaker's AirPlay receiver at one of those
+/// re-sends, until it was power-cycled.
 async fn actor(
     mut conn: Connection,
     url: String,
@@ -353,15 +357,7 @@ async fn actor(
     mut rx: mpsc::Receiver<Command>,
     mut volume: watch::Receiver<f32>,
     events: mpsc::Sender<SessionEvent>,
-    first_sound: Duration,
 ) {
-    // Some speakers (seen on Devialet after standby) play at their own level
-    // when audio starts, while still reporting ours, until the volume
-    // *changes*. So once sound has started, and again a little later, we
-    // send a hair lower value and then ours: two real changes, inaudible.
-    let started = tokio::time::Instant::now();
-    let mut reasserts = REASSERT_AFTER.iter().map(|d| started + first_sound + *d);
-    let mut next_reassert = reasserts.next();
     let mut keepalive = tokio::time::interval(FEEDBACK_INTERVAL);
     // After a slow request, send one keepalive, not a burst of missed ones.
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -378,17 +374,6 @@ async fn actor(
                     let resp = conn.request(volume_request(&url, db)).await?;
                     if resp.status() != Some(200) {
                         warn!("speaker rejected volume {db:.1} dB: {} {}", resp.status().unwrap_or(0), resp.reason());
-                    }
-                }
-                _ = tokio::time::sleep_until(next_reassert.unwrap_or(started)), if next_reassert.is_some() => {
-                    next_reassert = reasserts.next();
-                    let db = *volume.borrow();
-                    if db > MUTED_DB {
-                        debug!("session {id}: re-asserting volume {db:.1} dB");
-                        if let Some(nudged) = nudged_below(db) {
-                            conn.request(volume_request(&url, nudged)).await?;
-                        }
-                        conn.request(volume_request(&url, db)).await?;
                     }
                 }
                 cmd = rx.recv() => match cmd {

@@ -1,12 +1,14 @@
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use airpipe::airplay::connection::{Connection, USER_AGENT};
+use airpipe::airplay::connection::{Connection, NotAnswering, USER_AGENT};
 use airpipe::airplay::session::SessionEvent;
 use airpipe::config::{self, Config, LatencyProfile};
 use airpipe::control::{self, Reply, Request};
@@ -14,7 +16,6 @@ use airpipe::discovery::{self, Device, feature};
 use airpipe::group::volume::{self, VolumeInputs};
 use airpipe::group::{self, GroupConfig, Pipeline};
 use airpipe::proto::rtp::SAMPLE_RATE;
-use airpipe::proto::rtsp;
 use airpipe::store::{DeviceSettings, Store};
 
 #[derive(Parser)]
@@ -279,6 +280,30 @@ fn show_config(path: &Path, store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// How long `airpipe list` waits for each speaker to connect, then to answer.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Checks that a speaker's AirPlay receiver answers. mDNS cannot tell: a
+/// speaker that is off stays in Avahi's cache for a while, and one whose
+/// receiver hung keeps advertising itself.
+async fn probe(device: &Device) -> Result<()> {
+    // Anyone on the LAN can advertise any address; only contact LAN ones.
+    match device.address.ip() {
+        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => {}
+        _ => bail!("not checked (not a LAN address)"),
+    }
+    let connect = Connection::connect(device.address, vec![("User-Agent".into(), USER_AGENT.into())]);
+    let mut conn = match tokio::time::timeout(PROBE_TIMEOUT, connect).await {
+        Ok(conn) => conn?,
+        Err(_) => bail!("not reachable"),
+    };
+    match tokio::time::timeout(PROBE_TIMEOUT, conn.info()).await {
+        Ok(answer) => answer?,
+        Err(_) => bail!(NotAnswering),
+    };
+    Ok(())
+}
+
 async fn list(store: &Store) -> Result<()> {
     let scan = discovery::scan(Duration::from_secs(3)).await?;
     for name in &scan.unresponsive {
@@ -289,8 +314,11 @@ async fn list(store: &Store) -> Result<()> {
         println!("No AirPlay speakers found. Check that UDP 5353 (mDNS) is allowed from your LAN (see README).");
         return Ok(());
     }
+    // A few at a time: a misbehaving host could advertise hundreds.
+    let answers: Vec<_> = futures_util::stream::iter(&devices).map(probe).buffered(16).collect().await;
     println!("{:<24} {:<22} {:<28} NOTES", "NAME", "ADDRESS", "MODEL");
-    for d in devices {
+    for (d, answer) in devices.iter().zip(answers) {
+        let problem = answer.err().map(|e| format!("{e:#}"));
         let mut notes = Vec::new();
         notes.push(if d.is_airplay2() { "AirPlay 2" } else { "AirPlay 1 only (unsupported)" });
         if d.needs_pairing() {
@@ -298,6 +326,9 @@ async fn list(store: &Store) -> Result<()> {
         }
         if d.needs_password() {
             notes.push("password protected");
+        }
+        if let Some(p) = &problem {
+            notes.push(p);
         }
         let model = format!("{} {}", d.manufacturer, d.model);
         println!("{:<24} {:<22} {:<28} {}", d.name, d.address, model.trim(), notes.join(", "));
@@ -312,7 +343,7 @@ async fn find(name: &str) -> Result<Device> {
 async fn info(name: &str) -> Result<()> {
     let device = find(name).await?;
     let mut conn = Connection::connect(device.address, vec![("User-Agent".into(), USER_AGENT.into())]).await?;
-    let resp = conn.request_ok(rtsp::Request::new("GET", "/info")).await?;
+    let resp = conn.info().await?;
     let value = airpipe::proto::plist::parse(&resp.body).context("parsing /info")?;
     println!("{} ({})", device.name, device.address);
     println!("  model:    {} {} (firmware {})", device.manufacturer, device.model, device.firmware);
