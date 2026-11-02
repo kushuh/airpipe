@@ -158,7 +158,7 @@ async fn browse(timeout: Duration) -> Result<Scan> {
     // Prepare + Start (Server2, Avahi >= 0.8) avoids missing signals emitted
     // before we subscribe.
     let server2 = zbus::Proxy::new(&conn, AVAHI, "/", "org.freedesktop.Avahi.Server2").await?;
-    let path: zbus::zvariant::OwnedObjectPath =
+    let path: zbus::OwnedObjectPath =
         server2.call("ServiceBrowserPrepare", &(IF_UNSPEC, PROTO_INET, SERVICE, "", 0u32)).await?;
     let browser = zbus::Proxy::new(&conn, AVAHI, path, "org.freedesktop.Avahi.ServiceBrowser").await?;
     let mut items = browser.receive_signal("ItemNew").await?;
