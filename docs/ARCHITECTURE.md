@@ -259,9 +259,36 @@ cushion, the buffer skips ahead so latency stays bounded.
 
 ### Latency reporting
 
-The sink announces `ProcessLatency = latency + jitter cushion` to PipeWire.
-Players that do A/V sync (mpv, browsers, GStreamer) read it through the
-graph's latency reporting and delay video accordingly.
+Players that do A/V sync (mpv, VLC, browsers, GStreamer) ask how long until
+a sample they write is heard, and delay video by that much. The sink
+announces this as its input port's `Latency`, and as `ProcessLatency`
+(`group::output_latency`). The value is our jitter cushion, plus the AirPlay
+latency, plus the largest positive `latency_offset_ms`, which belongs to the
+speaker that plays last, so video is never early on any speaker.
+
+Only the port `Latency` reaches players. Observed on PipeWire 1.6: with
+`ProcessLatency` alone, players measured only the graph's ~30 ms, so video
+ran ahead of the sound by about the whole AirPlay latency. Since 1.6,
+PipeWire's own RTP and RAOP sinks publish both params the same way
+(`module-rtp/stream.c`). Before 1.6, pw_stream keeps a port `Latency` param
+only until the session manager reconfigures the node, so players may fall
+back to ~30 ms (read from PipeWire's source, not tested).
+
+The offsets come from the speakers playing now or on their first connection
+attempt or, while none is, from the configured ones. Players ask when they
+open a stream, which is before the first sound connects anything. Counting
+first attempts keeps the value steady while a group connects, and a speaker
+that keeps failing does not move it at each retry. `Group::report_latency`
+updates it when it changes (a speaker connecting or failing, `reload`). A
+speaker not found on the network yet counts with offset 0 until it connects.
+Negative offsets are not subtracted: they make a speaker that plays late
+play on time.
+
+A speaker's internal processing delay is not added either. AirPlay speakers
+play each sample at the time they are given and compensate their own output
+delay (shairport-sync does this with the delay its audio backend reports). A
+speaker that plays late anyway can only be detected by measuring it, which
+is what Apple TV's "Wireless Audio Sync" does.
 
 Below the low-latency preset (`latency_ms` < 500), our own cushion drops to
 1024 frames (about one PipeWire quantum), and the speaker is told it may

@@ -160,7 +160,9 @@ struct Member {
     session: Option<SessionHandle>,
     /// Lets this speaker use our timing port while connected; revoked on drop.
     permit: Option<PeerPermit>,
-    target: Option<TargetId>,
+    /// The engine target while streaming, with the `latency_offset_ms` it
+    /// plays with (a devices.toml change applies on the next connection).
+    target: Option<(TargetId, i32)>,
     failures: usize,
     /// The current connection attempt; results of older ones are dropped.
     attempt: u64,
@@ -262,12 +264,13 @@ pub async fn run(gc: GroupConfig, store: Store, control: control::Server) -> Res
     let (latency_ms, jitter_frames) = cfg.latency();
 
     let (volume_tx, mut volume_rx) = mpsc::unbounded_channel();
-    let jitter = Duration::from_secs_f64(jitter_frames as f64 / f64::from(SAMPLE_RATE));
+    // Updated with the speakers' offsets once they are known (`report_latency`).
+    let latency = output_latency(latency_ms, jitter_frames, 0);
     let sink = Sink::start(
         SinkConfig {
             node_name: cfg.output.node_name.clone(),
             description: output_description(&resolved.speakers),
-            latency: Duration::from_millis(latency_ms.into()) + jitter,
+            latency,
             forward_volume: cfg.volume.follow_system,
         },
         producer,
@@ -311,6 +314,7 @@ pub async fn run(gc: GroupConfig, store: Store, control: control::Server) -> Res
         last_progress: Instant::now(),
         attempts: 0,
         reloads: 0,
+        reported_latency: latency,
     };
     group.on_resolved(resolved);
 
@@ -382,6 +386,8 @@ struct Group {
     attempts: u64,
     /// Reloads requested so far; only the latest one is applied.
     reloads: u64,
+    /// Latency last reported to PipeWire.
+    reported_latency: Duration,
 }
 
 impl Group {
@@ -494,7 +500,7 @@ impl Group {
         let m = &mut self.members[i];
         m.device = Some(session.device.clone());
         m.settings = settings;
-        m.target = Some(target);
+        m.target = Some((target, settings.latency_offset_ms));
         m.session = Some(session);
         m.permit = Some(permit);
         m.state = MemberState::Streaming;
@@ -665,6 +671,29 @@ impl Group {
         }
         let streaming = self.members.iter().any(|m| m.state == MemberState::Streaming);
         self.streaming_tx.send_if_modified(|v| std::mem::replace(v, streaming) != streaming);
+        self.report_latency();
+    }
+
+    /// Keeps the latency reported to PipeWire equal to the delay of the
+    /// speakers playing now or on their first connection attempt, or, while
+    /// none is, of the speakers that will play: players ask for it when they
+    /// open a stream, before the first sound connects anything. Counting first
+    /// attempts keeps it steady while a group's speakers connect one by one;
+    /// a speaker that keeps failing counts again only once it plays, so the
+    /// value does not jump with each retry. The largest offset (the speaker
+    /// that plays last) sets it, so video is never early on any speaker.
+    fn report_latency(&mut self) {
+        let active = |m: &&Member| m.target.is_some() || (m.state == MemberState::Connecting && m.failures == 0);
+        let offset_of = |m: &Member| m.target.map_or(m.settings.latency_offset_ms, |(_, offset)| offset);
+        let offset = (self.members.iter().filter(active).map(offset_of).max())
+            .or_else(|| self.members.iter().map(|m| m.settings.latency_offset_ms).max());
+        let (latency_ms, jitter_frames) = self.gc.config.latency();
+        let latency = output_latency(latency_ms, jitter_frames, offset.unwrap_or(0));
+        if latency != self.reported_latency {
+            info!("output latency is now {} ms", latency.as_millis());
+            self.sink.set_latency(latency);
+            self.reported_latency = latency;
+        }
     }
 
     /// Starts connecting in the background; the outcome arrives in `on_connected`.
@@ -703,7 +732,7 @@ impl Group {
     /// background, so a slow speaker never blocks the event loop.
     fn release(&mut self, i: usize) {
         let m = &mut self.members[i];
-        if let Some(t) = m.target.take() {
+        if let Some((t, _)) = m.target.take() {
             self.pipeline.engine.remove_target(t);
         }
         if let Some(s) = m.session.take() {
@@ -716,7 +745,7 @@ impl Group {
     async fn release_all(&mut self) {
         let mut teardowns = Vec::new();
         for m in self.members.iter_mut() {
-            if let Some(t) = m.target.take() {
+            if let Some((t, _)) = m.target.take() {
                 self.pipeline.engine.remove_target(t);
             }
             if let Some(s) = m.session.take() {
@@ -793,6 +822,17 @@ impl Group {
     }
 }
 
+/// Delay from our output to the speakers' sound, which PipeWire passes on to
+/// players so they delay video by as much: our jitter cushion, the AirPlay
+/// latency, and a positive `latency_offset_ms`. A negative offset only makes
+/// a speaker that plays late play on time, so it delays nothing. See
+/// "Latency reporting" in docs/ARCHITECTURE.md.
+fn output_latency(latency_ms: u32, jitter_frames: usize, offset_ms: i32) -> Duration {
+    let delay_ms = latency_ms.saturating_add(offset_ms.max(0).unsigned_abs());
+    let frames = u64::from(stream::ms_to_frames(delay_ms)) + jitter_frames as u64;
+    Duration::from_nanos(frames * 1_000_000_000 / u64::from(SAMPLE_RATE))
+}
+
 fn schedule_retry(m: &mut Member, error: String) {
     let delay = RETRY_BACKOFF[m.failures.min(RETRY_BACKOFF.len() - 1)];
     warn!("{}: {error}; retrying in {delay}s", m.name);
@@ -838,4 +878,20 @@ fn send_progress(s: &SessionHandle, np: &NowPlaying, engine: &Engine) {
     let current = engine.playing_rtptime();
     let start = current.wrapping_sub(stream::duration_to_rtp_frames(pos + at.elapsed()));
     s.send(Command::Progress { start, current, end: start.wrapping_add(stream::duration_to_rtp_frames(length)) });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_latency_follows_the_speaker_offset() {
+        // 250 ms plus a 1024-frame cushion (23.2 ms).
+        let base = output_latency(250, 1024, 0);
+        assert_eq!(base.as_micros(), 273_219);
+        assert_eq!(output_latency(250, 1024, 100) - base, Duration::from_millis(100));
+        // A negative offset brings a late speaker back on time: nothing to add.
+        assert_eq!(output_latency(250, 1024, -100), base);
+        assert_eq!(output_latency(1000, 3072, -200), output_latency(1000, 3072, 0));
+    }
 }

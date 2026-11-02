@@ -25,7 +25,8 @@ terminal or in the background.
 * **Speaker buttons work:** play, pause, next and previous on the speaker
   (or its app) control your music player.
 * **Video stays in sync:** video players automatically delay the picture to
-  match the speakers.
+  match the speakers (PipeWire 1.6 or newer; on older versions video may
+  run ahead of the sound).
 * **Plays nicely with others:** airpipe only uses a speaker while sound is
   playing, so your phone or other computers can use it the rest of the time.
 * **One-way only:** airpipe only *sends* sound. It never accepts audio or
