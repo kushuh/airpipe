@@ -61,7 +61,7 @@ pipewire = "0.10.1"
 # Exact version: the iterative event reader used to vet untrusted plists
 # (src/proto/plist.rs) is behind this "unstable" feature. Upgrades are
 # reviewed by hand (CI fails to compile if the API changes).
-plist = { version = "=1.10.1", features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
+plist = { version = "=1.10.3", features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
 rtrb = "0.4.0"
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.1"
