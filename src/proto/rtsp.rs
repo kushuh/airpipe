@@ -10,6 +10,13 @@ use thiserror::Error;
 /// error. Speakers send small replies (a few KiB at most), so this mainly
 /// bounds memory if a peer misbehaves.
 const MAX_MESSAGE: usize = 1024 * 1024;
+/// Speaker text quoted in errors (which reach `airpipe list` rows) is cut to
+/// this many characters. Reason phrases are a few words ("Not Found").
+const MAX_QUOTE_CHARS: usize = 80;
+
+fn quote(s: &str) -> String {
+    s.chars().take(MAX_QUOTE_CHARS).collect()
+}
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -44,10 +51,13 @@ impl Message {
         parts.next()?.parse().ok()
     }
 
-    /// Reason phrase of a response, for error messages. It comes from the
-    /// network, so control characters are replaced.
+    /// Reason phrase of a response, for error messages (shown in `airpipe
+    /// list` rows). It comes from the network, so it is kept short and on
+    /// one line: the parser splits lines on CRLF only, so a bare LF can be
+    /// in it.
     pub fn reason(&self) -> String {
-        super::printable(self.start_line.splitn(3, ' ').nth(2).unwrap_or(""))
+        let reason = self.start_line.splitn(3, ' ').nth(2).unwrap_or("");
+        super::printable_line(&quote(reason))
     }
 
     /// Tries to parse one complete message from the front of `buf`.
@@ -65,11 +75,11 @@ impl Message {
         let mut lines = head.split("\r\n");
         let start_line = lines.next().unwrap_or_default().to_string();
         if start_line.split(' ').count() < 2 {
-            return Err(ParseError::StartLine(start_line));
+            return Err(ParseError::StartLine(quote(&start_line)));
         }
         let mut headers = Vec::new();
         for line in lines {
-            let (k, v) = line.split_once(':').ok_or_else(|| ParseError::Header(line.to_string()))?;
+            let (k, v) = line.split_once(':').ok_or_else(|| ParseError::Header(quote(line)))?;
             headers.push((k.trim().to_string(), v.trim().to_string()));
         }
         let mut msg = Message { start_line, headers, body: Vec::new() };
@@ -164,6 +174,16 @@ mod tests {
         assert_eq!(msg.reason(), "OK");
         assert_eq!(msg.header("cseq"), Some("1"));
         assert_eq!(msg.body, b"body");
+    }
+
+    #[test]
+    fn reason_cannot_fake_rows() {
+        let long = "x".repeat(500);
+        let raw = format!("RTSP/1.0 404 Not\nKitchen \u{202E}row {long}\r\n\r\n");
+        let (msg, _) = Message::parse(raw.as_bytes()).unwrap().unwrap();
+        let reason = msg.reason();
+        assert!(reason.starts_with("Not\u{FFFD}Kitchen \u{FFFD}row x"));
+        assert_eq!(reason.chars().count(), MAX_QUOTE_CHARS);
     }
 
     #[test]

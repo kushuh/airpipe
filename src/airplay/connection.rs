@@ -17,6 +17,13 @@ use crate::proto::rtsp::{Message, Request};
 #[error("speaker closed the connection")]
 pub struct ClosedBySpeaker;
 
+/// The speaker accepted the connection but did not answer `GET /info`.
+/// Observed on a Devialet Phantom: once its AirPlay receiver hangs like this,
+/// it stays hung (while still advertising itself) until it is power-cycled.
+#[derive(Debug, thiserror::Error)]
+#[error("speaker accepts connections but does not answer (if this lasts, turn it off and on)")]
+pub struct NotAnswering;
+
 fn is_closed_by_peer(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
     matches!(e.kind(), ConnectionReset | ConnectionAborted | BrokenPipe)
@@ -79,6 +86,17 @@ impl Connection {
         })
         .await
         .with_context(|| format!("timed out waiting for response to {} {}", req.method, req.uri))?
+    }
+
+    /// `GET /info`, the first request of a session. Fails with
+    /// [`NotAnswering`] when the speaker does not answer in time.
+    pub async fn info(&mut self) -> Result<Message> {
+        match self.request_ok(Request::new("GET", "/info")).await {
+            // `request` reports a timeout as tokio's `Elapsed` under context;
+            // anyhow's `is` looks through the context.
+            Err(e) if e.is::<tokio::time::error::Elapsed>() => Err(NotAnswering.into()),
+            other => other,
+        }
     }
 
     /// Like [`Connection::request`] but fails on non-2xx status.
