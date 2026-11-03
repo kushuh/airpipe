@@ -29,6 +29,7 @@ local snap = {
     busy = nil, -- label of the action in progress
     error = nil, -- why the last action failed
     restartNeeded = false, -- config.toml changed while airpipe was running
+    version = nil, -- of the airpipe command, e.g. "0.4.0"
 }
 local lastNonce = 0
 local polling = false
@@ -160,6 +161,19 @@ local function loadConfig()
         if doc ~= nil and tonumber(doc.api) == API_VERSION then
             snap.config = doc
         end
+        publish()
+    end)
+end
+
+-- The airpipe command's version, shown in the panel. Read again on every
+-- refresh (the panel opening), so an update shows up without a restart.
+local function loadVersion()
+    if not noctalia.commandExists(binary()) then
+        snap.version = nil
+        return
+    end
+    run({ binary(), "--version" }, POLL_TIMEOUT_MS, function(result)
+        snap.version = tostring(result.stdout or ""):match("^airpipe%s+(%S+)")
         publish()
     end)
 end
@@ -306,6 +320,7 @@ local handlers = {
     end,
     scan = scan,
     refresh = function()
+        loadVersion()
         loadConfig()
         poll()
     end,
@@ -362,5 +377,6 @@ end
 local pending = noctalia.state.get(COMMAND_KEY)
 lastNonce = type(pending) == "table" and (tonumber(pending.nonce) or 0) or 0
 noctalia.setUpdateInterval(pollInterval() * 1000)
+loadVersion()
 loadConfig()
 poll()

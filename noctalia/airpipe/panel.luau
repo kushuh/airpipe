@@ -534,10 +534,17 @@ function render()
             end
         end
     end
-    panel.render(ui.column({ flexGrow = 1, gap = 12 }, {
-        header(),
-        ui.scroll({ flexGrow = 1, gap = 12 }, body),
-    }))
+    local children = { header(), ui.scroll({ flexGrow = 1, gap = 12 }, body) }
+    if snapshot.version ~= nil then
+        -- Outside the scroll area, so it is always visible.
+        table.insert(children, ui.label({
+            key = "version",
+            text = tr("panel.version", { version = snapshot.version }),
+            color = "on_surface_variant",
+            fontSize = 11,
+        }))
+    end
+    panel.render(ui.column({ flexGrow = 1, gap = 12 }, children))
 end
 
 noctalia.state.watch(STATE_KEY, function(value)

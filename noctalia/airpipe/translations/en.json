@@ -44,7 +44,8 @@
   },
   "panel": {
     "refresh": "Refresh",
-    "title": "AirPlay"
+    "title": "AirPlay",
+    "version": "airpipe {version}"
   },
   "settings": {
     "autostart": "Start at login",
