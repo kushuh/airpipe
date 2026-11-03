@@ -54,12 +54,15 @@ pub struct VolumeInputs {
     pub cap: Option<f32>,
     /// Follow the system volume; otherwise play at `default_volume`.
     pub follow_system: bool,
+    /// A lower ceiling kept after a settings change would have made the
+    /// speaker louder at once (see [`hold_after_change`]).
+    pub hold: Option<f32>,
 }
 
 impl VolumeInputs {
     /// The highest slider position this speaker may play at.
     pub fn ceiling_level(&self) -> f32 {
-        self.settings.max_volume.min(self.cap.unwrap_or(1.0)).clamp(0.0, 1.0)
+        self.settings.max_volume.min(self.cap.unwrap_or(1.0)).min(self.hold.unwrap_or(1.0)).clamp(0.0, 1.0)
     }
 
     /// The loudest AirPlay value this speaker may receive.
@@ -91,6 +94,20 @@ impl VolumeInputs {
     }
 }
 
+/// After a speaker's settings change while it plays (e.g. a higher
+/// `max_volume` from a settings UI), the ceiling that keeps it at the level
+/// it played at `before` (AirPlay dB). Raising a cap must not turn the speaker
+/// up at once to a desktop slider sitting far above it; the next volume
+/// change by the user lifts the hold. None when it gets no louder, and when
+/// the speaker does not follow a reported system volume: then the new
+/// settings are the volume the user just chose.
+pub fn hold_after_change(before_db: f32, after: &VolumeInputs, system: Option<SystemVolume>) -> Option<f32> {
+    if !after.follow_system || system.is_none() {
+        return None;
+    }
+    (after.airplay_db(system) > before_db).then(|| db_to_level(before_db))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +118,7 @@ mod tests {
             gain_db: 0.0,
             cap: None,
             follow_system: true,
+            hold: None,
         }
     }
 
@@ -149,5 +167,27 @@ mod tests {
         assert_eq!(v.airplay_db(sys(0.0)), -18.0);
         v.gain_db = -6.0;
         assert_eq!(v.airplay_db(None), -24.0);
+    }
+
+    #[test]
+    fn raising_the_cap_while_playing_holds_the_old_level() {
+        // Capped at 25% while the desktop slider sits at 90%.
+        let before = inputs(0.25, 0.25).airplay_db(sys(0.9));
+        let raised = inputs(0.25, 1.0);
+        let hold = hold_after_change(before, &raised, sys(0.9)).expect("would have jumped to 90%");
+        assert!((hold - 0.25).abs() < 1e-6);
+        let held = VolumeInputs { hold: Some(hold), ..raised };
+        assert_eq!(held.airplay_db(sys(0.9)), before, "stays at 25% until the user moves the volume");
+        assert_eq!(held.airplay_db(sys(0.1)), raised.airplay_db(sys(0.1)), "quieter is never held back");
+        // Lowering the cap, or raising it above where the slider is, needs no hold.
+        assert_eq!(hold_after_change(before, &inputs(0.25, 0.1), sys(0.9)), None);
+        let quiet = inputs(0.25, 0.25).airplay_db(sys(0.2));
+        assert_eq!(hold_after_change(quiet, &raised, sys(0.2)), None);
+        // At fixed volumes the new default is the volume the user just chose.
+        let fixed = VolumeInputs { follow_system: false, ..inputs(0.4, 1.0) };
+        let floor = VolumeInputs { follow_system: false, ..inputs(0.0, 1.0) }.airplay_db(None);
+        assert_eq!(hold_after_change(floor, &fixed, sys(0.9)), None, "never held at the floor, i.e. muted");
+        // Nothing to hold to before the desktop has reported a volume.
+        assert_eq!(hold_after_change(before, &raised, None), None);
     }
 }

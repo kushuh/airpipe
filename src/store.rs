@@ -34,6 +34,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::SigningKey;
 use toml_edit::{DocumentMut, Item, Table, value};
 
+use crate::api::KnownSpeaker;
 use crate::crypto::pairing::{DeviceKeys, Identity};
 use crate::discovery::Device;
 
@@ -146,6 +147,7 @@ impl Store {
 
     /// Our identity, created on first use.
     pub fn identity(&self) -> Result<LocalIdentity> {
+        let _lock = edit_lock(&self.dir)?;
         let mut doc = self.load()?;
         if let Some(t) = doc.get("controller").and_then(Item::as_table) {
             let get = |k: &str| t.get(k).and_then(Item::as_str).ok_or_else(|| anyhow!("[controller] {k} missing"));
@@ -169,6 +171,7 @@ impl Store {
     /// Settings for a speaker. A speaker seen for the first time is recorded
     /// with defaults for its model, so the user can find and edit it.
     pub fn device_settings(&self, device: &Device) -> Result<DeviceSettings> {
+        let _lock = edit_lock(&self.dir)?;
         let mut doc = self.load()?;
         let defaults =
             inherit_lower_limits(&doc, &device.name, DeviceSettings::defaults_for(&device.manufacturer, &device.model));
@@ -177,8 +180,8 @@ impl Store {
         let mut changed = false;
         let fresh: [(&str, Item); 4] = [
             ("model", value(model)),
-            ("default_volume", value(percent(defaults.default_volume))),
-            ("max_volume", value(percent(defaults.max_volume))),
+            ("default_volume", value(whole_percent(defaults.default_volume))),
+            ("max_volume", value(whole_percent(defaults.max_volume))),
             ("latency_offset_ms", value(defaults.latency_offset_ms as i64)),
         ];
         for (old, new, written_by_airpipe) in OLD_KEYS {
@@ -187,12 +190,12 @@ impl Store {
             if let Some(level) = old_level(&item, written_by_airpipe)
                 && !entry.contains_key(new)
             {
-                entry.insert(new, value(percent(level)));
+                entry.insert(new, value(whole_percent(level)));
             }
         }
         // The display name follows the speaker; the rest is only filled in.
         if entry.get("name").and_then(Item::as_str) != Some(device.name.as_str()) {
-            entry.insert("name", value(device.name.as_str()));
+            crate::config::replace_value(entry, "name", value(device.name.as_str()));
             changed = true;
         }
         for (key, item) in fresh {
@@ -202,26 +205,79 @@ impl Store {
             }
         }
 
-        let num = |k: &str, d: f32| {
-            entry
-                .get(k)
-                .and_then(|i| i.as_float().or_else(|| i.as_integer().map(|n| n as f64)))
-                .map(|v| v as f32)
-                .unwrap_or(d)
-        };
-        let settings = DeviceSettings {
-            default_volume: num("default_volume", defaults.default_volume * 100.0) / 100.0,
-            max_volume: num("max_volume", defaults.max_volume * 100.0) / 100.0,
-            latency_offset_ms: entry
-                .get("latency_offset_ms")
-                .and_then(Item::as_integer)
-                .unwrap_or(defaults.latency_offset_ms as i64) as i32,
-        }
-        .sanitized(defaults);
+        let settings = read_settings(entry, defaults);
         if changed {
             self.save(&doc)?;
         }
         Ok(settings)
+    }
+
+    /// Every speaker recorded here, with its settings as airpipe applies
+    /// them. Read-only: entries are not migrated or completed.
+    pub fn known_speakers(&self) -> Result<Vec<KnownSpeaker>> {
+        let doc = self.load()?;
+        let Some(devices) = doc.get("devices").and_then(Item::as_table) else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for (id, entry) in devices.iter() {
+            let Some(entry) = entry.as_table() else { continue };
+            let model = entry.get("model").and_then(Item::as_str).unwrap_or_default();
+            let settings = read_settings(entry, DeviceSettings::defaults_for("", model));
+            out.push(KnownSpeaker {
+                id: id.to_string(),
+                name: entry.get("name").and_then(Item::as_str).unwrap_or(id).to_string(),
+                model: model.to_string(),
+                default_volume: crate::api::percent(settings.default_volume),
+                max_volume: crate::api::percent(settings.max_volume),
+                latency_offset_ms: settings.latency_offset_ms,
+                paired: entry.contains_key("pairing"),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Changes one per-speaker setting (`default_volume`, `max_volume` in
+    /// whole %, `latency_offset_ms`) in every entry with this name, keeping
+    /// the rest of the file as it is. Out-of-range values are refused, not
+    /// clamped, and so is a `default_volume` above `max_volume`; lowering
+    /// `max_volume` below `default_volume` lowers both.
+    pub fn set_speaker_setting(&self, speaker: &str, key: &str, value: &str) -> Result<()> {
+        let offsets = crate::config::LATENCY_OFFSET_MS_RANGE;
+        let range = match key {
+            "default_volume" | "max_volume" => 0..=100,
+            "latency_offset_ms" => i64::from(*offsets.start())..=i64::from(*offsets.end()),
+            _ => bail!("{key:?} is not a speaker setting; settable: default_volume, max_volume, latency_offset_ms"),
+        };
+        let n: i64 = value.trim().parse().with_context(|| format!("{key} must be a whole number"))?;
+        if !range.contains(&n) {
+            bail!("{key} must be between {} and {}", range.start(), range.end());
+        }
+        let _lock = edit_lock(&self.dir)?;
+        let mut doc = self.load()?;
+        let entries = doc.get_mut("devices").and_then(Item::as_table_mut).into_iter().flat_map(|d| d.iter_mut());
+        let mut found = false;
+        for (_, entry) in entries {
+            let Some(entry) = entry.as_table_mut() else { continue };
+            if !entry.get("name").and_then(Item::as_str).is_some_and(|n| n.eq_ignore_ascii_case(speaker)) {
+                continue;
+            }
+            found = true;
+            let model = entry.get("model").and_then(Item::as_str).unwrap_or_default();
+            let now = read_settings(entry, DeviceSettings::defaults_for("", model));
+            let (default, max) = (whole_percent(now.default_volume), whole_percent(now.max_volume));
+            if key == "default_volume" && n > max {
+                bail!("default_volume ({n}) cannot be above max_volume ({max}); raise max_volume first");
+            }
+            // Only an explicit default: a missing one is filled in later with
+            // the model's (conservative) default, never above the cap.
+            if key == "max_volume" && default > n && entry.contains_key("default_volume") {
+                crate::config::replace_value(entry, "default_volume", toml_edit::value(n));
+            }
+            crate::config::replace_value(entry, key, toml_edit::value(n));
+        }
+        if !found {
+            return Err(NotKnown(speaker.to_string()).into());
+        }
+        self.save(&doc)
     }
 
     /// Pairing keys for a speaker about to be connected.
@@ -272,6 +328,7 @@ impl Store {
     }
 
     pub fn save_device_keys(&self, device_id: &str, name: &str, keys: &DeviceKeys) -> Result<()> {
+        let _lock = edit_lock(&self.dir)?;
         let mut doc = self.load()?;
         let entry = device_table(&mut doc, device_id);
         if !entry.contains_key("name") {
@@ -288,6 +345,7 @@ impl Store {
 
     /// Returns true if a pairing was removed. Per-device settings are kept.
     pub fn remove_device_keys(&self, device_id: &str) -> Result<bool> {
+        let _lock = edit_lock(&self.dir)?;
         let mut doc = self.load()?;
         let removed = doc
             .get_mut("devices")
@@ -337,8 +395,29 @@ fn old_level(item: &Item, written_by_airpipe: [f64; 2]) -> Option<f32> {
 }
 
 /// A slider position as a whole percentage for devices.toml.
-fn percent(level: f32) -> i64 {
+fn whole_percent(level: f32) -> i64 {
     (level * 100.0).round() as i64
+}
+
+/// A device entry's settings, missing or unreadable values taken from
+/// `defaults`, then brought into range.
+fn read_settings(entry: &Table, defaults: DeviceSettings) -> DeviceSettings {
+    let num = |k: &str, d: f32| {
+        entry
+            .get(k)
+            .and_then(|i| i.as_float().or_else(|| i.as_integer().map(|n| n as f64)))
+            .map(|v| v as f32)
+            .unwrap_or(d)
+    };
+    DeviceSettings {
+        default_volume: num("default_volume", defaults.default_volume * 100.0) / 100.0,
+        max_volume: num("max_volume", defaults.max_volume * 100.0) / 100.0,
+        latency_offset_ms: entry
+            .get("latency_offset_ms")
+            .and_then(Item::as_integer)
+            .unwrap_or(defaults.latency_offset_ms as i64) as i32,
+    }
+    .sanitized(defaults)
 }
 
 fn set_controller(doc: &mut DocumentMut, id: &LocalIdentity) {
@@ -367,6 +446,30 @@ fn device_table<'a>(doc: &'a mut DocumentMut, device_id: &str) -> &'a mut Table 
         })
         .as_table_mut()
         .expect("device entry is a table")
+}
+
+/// A speaker without an entry in devices.toml: airpipe has never used it.
+#[derive(Debug, thiserror::Error)]
+#[error("airpipe has not used {0:?} yet")]
+pub struct NotKnown(pub String);
+
+/// Locks the config directory against other airpipe processes until the
+/// returned file is dropped. Every read-modify-write of config.toml and
+/// devices.toml holds it (the running airpipe, `config set`, `use`...), so
+/// two writers never lose each other's change (e.g. a lowered max_volume).
+pub(crate) fn edit_lock(dir: &Path) -> Result<fs::File> {
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(".lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock().with_context(|| format!("locking {}", path.display()))?;
+    Ok(file)
 }
 
 /// Atomically writes a file readable only by the current user.
@@ -438,6 +541,50 @@ mod tests {
         assert!(text.contains("model = \"Devialet Phantom 103 dB\""), "{text}");
         assert!(text.contains("default_volume = 25"), "{text}");
         assert!(text.starts_with("# airpipe device memory"), "{text}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn speaker_settings_are_listed_and_changed_by_name() {
+        let dir = temp_dir();
+        let store = Store::open(dir.clone());
+        assert!(store.known_speakers().unwrap().is_empty(), "no file yet");
+        store.device_settings(&device("Bureau", "Devialet", "Phantom 103 dB")).unwrap();
+        let edited = fs::read_to_string(store.path())
+            .unwrap()
+            .replace("max_volume = 100", "# neighbours complained\nmax_volume = 100 # mine");
+        fs::write(store.path(), edited).unwrap();
+
+        store.set_speaker_setting("bureau", "max_volume", "60").unwrap();
+        store.set_speaker_setting("Bureau", "latency_offset_ms", "-40").unwrap();
+        let text = fs::read_to_string(store.path()).unwrap();
+        assert!(text.contains("# neighbours complained\nmax_volume = 60 # mine"), "{text}");
+        let known = store.known_speakers().unwrap();
+        assert_eq!(known.len(), 1);
+        let k = &known[0];
+        assert_eq!(
+            (k.id.as_str(), k.name.as_str(), k.model.as_str()),
+            ("ID-Bureau", "Bureau", "Devialet Phantom 103 dB")
+        );
+        assert_eq!(
+            (k.default_volume.round(), k.max_volume.round(), k.latency_offset_ms, k.paired),
+            (25.0, 60.0, -40, false)
+        );
+
+        assert!(store.set_speaker_setting("Bureau", "max_volume", "101").is_err());
+        assert!(store.set_speaker_setting("Bureau", "max_volume", "loud").is_err());
+        assert!(store.set_speaker_setting("Bureau", "latency_offset_ms", "5000").is_err());
+        assert!(store.set_speaker_setting("Bureau", "name", "x").is_err());
+        assert!(store.set_speaker_setting("Kitchen", "max_volume", "50").unwrap_err().is::<NotKnown>());
+        // The default never ends up above the maximum.
+        assert!(store.set_speaker_setting("Bureau", "default_volume", "70").is_err(), "above max 60");
+        store.set_speaker_setting("Bureau", "max_volume", "10").unwrap();
+        let k = &store.known_speakers().unwrap()[0];
+        assert_eq!(
+            (k.default_volume.round(), k.max_volume.round()),
+            (10.0, 10.0),
+            "lowering the max lowers the default"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

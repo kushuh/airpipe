@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 
 use crate::airplay::events::RemoteCommand;
 use crate::airplay::session::{self, Command, IfInUse, InUse, SessionContext, SessionEvent, SessionHandle, SessionId};
+use crate::api::{self, SpeakerState};
 use crate::config::{Config, StartVolume};
 use crate::control::{self, Reply, Request};
 use crate::discovery::{self, Device, feature};
@@ -189,6 +190,10 @@ struct Member {
     /// Set when the connection was lost while the computer slept: until the
     /// sound stops, connection attempts give way to another device.
     give_way: bool,
+    /// Ceiling kept after a reload would have made it louder at once
+    /// (`volume::hold_after_change`), until the user changes the volume; it
+    /// survives reconnections, so the jump never comes back later.
+    ceiling_hold: Option<f32>,
 }
 
 impl Member {
@@ -206,6 +211,7 @@ impl Member {
             attempt: 0,
             last_error: None,
             give_way: false,
+            ceiling_hold: None,
         }
     }
 
@@ -456,6 +462,7 @@ impl Group {
             gain_db: m.gain_db,
             cap: self.gc.volume_cap,
             follow_system: self.gc.config.volume.follow_system,
+            hold: m.ceiling_hold,
         }
     }
 
@@ -502,6 +509,10 @@ impl Group {
         if self.system != Some(new) {
             debug!("system volume {:.0}%{}", new.level * 100.0, if new.muted { " (muted)" } else { "" });
             self.system = Some(new);
+            // The user has chosen a volume again: settings apply in full.
+            for m in &mut self.members {
+                m.ceiling_hold = None;
+            }
             for m in &self.members {
                 self.send_volume(m);
             }
@@ -613,6 +624,7 @@ impl Group {
         let answer = match request {
             Request::Stop => return,
             Request::Status => Reply::ok(self.status()),
+            Request::StatusJson => Reply::ok(api::to_json(&self.report())),
             Request::Gain { speaker, db } => match self.member_index(&speaker) {
                 None => {
                     Reply::error(format!("{speaker:?} is not one of the speakers in use ({})", self.speaker_list()))
@@ -680,7 +692,18 @@ impl Group {
                     let _ = writeln!(text, "{name}: not on the network right now; airpipe connects when it shows up");
                 }
                 Some(d) => match self.store.device_settings(d) {
-                    Ok(s) => m.settings = s,
+                    Ok(s) => {
+                        let before = self.volume_inputs(&self.members[i]).airplay_db(self.system);
+                        let m = &mut self.members[i];
+                        m.settings = s;
+                        if m.session.is_some() {
+                            let after = self.volume_inputs(&self.members[i]);
+                            if let Some(hold) = volume::hold_after_change(before, &after, self.system) {
+                                info!("{name}: higher volume limit applies when the volume is next changed");
+                                self.members[i].ceiling_hold = Some(hold);
+                            }
+                        }
+                    }
                     Err(e) => {
                         let _ = writeln!(text, "{name}: {e:#}");
                     }
@@ -834,49 +857,88 @@ impl Group {
         }
     }
 
+    /// The state `airpipe status` shows, also served as JSON.
+    fn report(&self) -> api::Status {
+        let follow_system = self.gc.config.volume.follow_system;
+        let output = api::Output {
+            name: output_description(&self.speaker_names()),
+            node_name: self.gc.config.output.node_name.clone(),
+            follow_system,
+            volume: self.system.filter(|_| follow_system).map(|v| api::percent(v.level)),
+            muted: follow_system && self.system.is_some_and(|v| v.muted),
+            last_audio_secs: self.last_audio_at.map(|t| t.elapsed().as_secs()),
+        };
+        let speakers = self
+            .members
+            .iter()
+            .map(|m| {
+                let (state, retry_in_secs) = match m.state {
+                    MemberState::Idle => (SpeakerState::Idle, None),
+                    MemberState::Connecting => (SpeakerState::Connecting, None),
+                    MemberState::Streaming => (SpeakerState::Streaming, None),
+                    MemberState::Yielded => (SpeakerState::InUse, None),
+                    MemberState::Waiting { until } => {
+                        (SpeakerState::Retrying, Some(until.saturating_duration_since(Instant::now()).as_secs()))
+                    }
+                };
+                let v = self.volume_inputs(m);
+                let db = v.airplay_db(self.system);
+                api::Speaker {
+                    id: m.device.as_ref().map(|d| d.device_id.clone()),
+                    name: m.name.clone(),
+                    state,
+                    retry_in_secs,
+                    volume: (db != MUTED_DB).then(|| api::percent(volume::db_to_level(db))),
+                    default_volume: api::percent(m.settings.default_volume),
+                    max_volume: api::percent(VolumeInputs { hold: None, ..v }.ceiling_level()),
+                    gain_db: m.gain_db,
+                    address: m.device.as_ref().map(|d| d.address.to_string()),
+                    last_error: m.last_error.clone(),
+                }
+            })
+            .collect();
+        api::Status { api: api::VERSION, running: true, output: Some(output), speakers }
+    }
+
     fn status(&self) -> String {
+        let report = self.report();
+        let out_state = report.output.as_ref().expect("a running group has an output");
         let mut out = String::new();
-        let audio = match self.last_audio_at {
-            Some(t) => format!("last audio {}s ago", t.elapsed().as_secs()),
+        let audio = match out_state.last_audio_secs {
+            Some(secs) => format!("last audio {secs}s ago"),
             None => "no audio yet".into(),
         };
-        let vol = match (self.gc.config.volume.follow_system, self.system) {
+        let vol = match (out_state.follow_system, out_state.volume) {
             (false, _) => "fixed per-speaker volumes (follow_system = false)".to_string(),
-            (true, Some(v)) => format!("volume {:.0}%{}", v.level * 100.0, if v.muted { " (muted)" } else { "" }),
+            (true, Some(v)) => format!("volume {v:.0}%{}", if out_state.muted { " (muted)" } else { "" }),
             (true, None) => "volume not reported by the desktop yet".to_string(),
         };
-        let _ = writeln!(out, "output {:?}: {vol}, {audio}", output_description(&self.speaker_names()));
-        if self.members.is_empty() {
+        let _ = writeln!(out, "output {:?}: {vol}, {audio}", out_state.name);
+        if report.speakers.is_empty() {
             out.push_str("no speaker selected: run `airpipe use <speaker>` (see `airpipe list`)\n");
         }
-        for m in &self.members {
-            let state = match m.state {
-                MemberState::Idle => "idle".to_string(),
-                MemberState::Connecting => "connecting".to_string(),
-                MemberState::Streaming => "streaming".to_string(),
-                MemberState::Yielded => "in use by another device".to_string(),
-                MemberState::Waiting { until } => {
-                    format!("retry in {}s", until.saturating_duration_since(Instant::now()).as_secs())
-                }
+        for s in &report.speakers {
+            let state = match s.state {
+                SpeakerState::Idle => "idle".to_string(),
+                SpeakerState::Connecting => "connecting".to_string(),
+                SpeakerState::Streaming => "streaming".to_string(),
+                SpeakerState::InUse => "in use by another device".to_string(),
+                SpeakerState::Retrying => format!("retry in {}s", s.retry_in_secs.unwrap_or(0)),
             };
-            let v = self.volume_inputs(m);
-            let db = v.airplay_db(self.system);
-            let playing =
-                if db == MUTED_DB { "muted".to_string() } else { format!("{:.0}%", volume::db_to_level(db) * 100.0) };
-            let addr = m.device.as_ref().map(|d| d.address.to_string()).unwrap_or_default();
+            let playing = match s.volume {
+                Some(v) => format!("{v:.0}%"),
+                None => "muted".to_string(),
+            };
             let _ = write!(
                 out,
                 "  {:<20} {:<24} {playing:>5} (default {:.0}%, max {:.0}%",
-                m.name,
-                state,
-                m.settings.default_volume * 100.0,
-                v.ceiling_level() * 100.0
+                s.name, state, s.default_volume, s.max_volume
             );
-            if m.gain_db != 0.0 {
-                let _ = write!(out, ", gain {:.1} dB", m.gain_db);
+            if s.gain_db != 0.0 {
+                let _ = write!(out, ", gain {:.1} dB", s.gain_db);
             }
-            let _ = writeln!(out, ")  {addr}");
-            if let Some(e) = &m.last_error {
+            let _ = writeln!(out, ")  {}", s.address.as_deref().unwrap_or_default());
+            if let Some(e) = &s.last_error {
                 let _ = writeln!(out, "  {:<20} last error: {e}", "");
             }
         }

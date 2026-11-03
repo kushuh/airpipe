@@ -57,6 +57,8 @@ pub struct NotRunning;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     Status,
+    /// The same as JSON ([`crate::api::Status`]), for desktop integrations.
+    StatusJson,
     /// Re-read config.toml (speakers) and devices.toml (volumes) and apply them.
     Reload,
     /// Live per-speaker trim in dB, until restart.
@@ -88,6 +90,7 @@ impl Request {
     fn encode(&self) -> String {
         let fields = match self {
             Request::Status => vec!["status".to_string()],
+            Request::StatusJson => vec!["status-json".to_string()],
             Request::Reload => vec!["reload".to_string()],
             Request::Gain { speaker, db } => vec!["gain".into(), speaker.clone(), db.to_string()],
             Request::Stop => vec!["stop".to_string()],
@@ -99,6 +102,7 @@ impl Request {
         let fields: Vec<&str> = line.trim_end_matches('\n').split('\t').collect();
         match fields.as_slice() {
             ["status"] => Some(Request::Status),
+            ["status-json"] => Some(Request::StatusJson),
             ["reload"] => Some(Request::Reload),
             ["stop"] => Some(Request::Stop),
             ["gain", speaker, db] => Some(Request::Gain {
@@ -286,7 +290,9 @@ async fn send_to(path: &Path, request: &Request) -> Result<Reply> {
     let exchange = async {
         stream.write_all(request.encode().as_bytes()).await?;
         let mut text = String::new();
-        stream.take(MAX_REPLY).read_to_string(&mut text).await?;
+        stream.take(MAX_REPLY + 1).read_to_string(&mut text).await?;
+        // A cut reply could be half a JSON document: fail instead.
+        anyhow::ensure!(text.len() as u64 <= MAX_REPLY, "airpipe's reply is too long");
         anyhow::Ok(text)
     };
     let text = tokio::time::timeout(REPLY_TIMEOUT, exchange).await.context("airpipe did not answer in time")??;
@@ -299,9 +305,13 @@ mod tests {
 
     #[test]
     fn requests_round_trip() {
-        for r in
-            [Request::Status, Request::Reload, Request::Stop, Request::Gain { speaker: "Living Room".into(), db: -6.5 }]
-        {
+        for r in [
+            Request::Status,
+            Request::StatusJson,
+            Request::Reload,
+            Request::Stop,
+            Request::Gain { speaker: "Living Room".into(), db: -6.5 },
+        ] {
             assert_eq!(Request::decode(&r.encode()), Some(r));
         }
         assert_eq!(Request::decode("gain\tKitchen\tloud\n"), None);
