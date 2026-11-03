@@ -28,7 +28,8 @@ terminal or in the background.
   match the speakers (PipeWire 1.6 or newer; on older versions video may
   run ahead of the sound).
 * **Plays nicely with others:** airpipe only uses a speaker while sound is
-  playing, so your phone or other computers can use it the rest of the time.
+  playing, so your phone or other computers can use it the rest of the time
+  (unless you keep it connected with `idle_timeout_secs = 0`).
 * **One-way only:** airpipe only *sends* sound. It never accepts audio or
   video from the network, and never appears as an AirPlay receiver.
 
@@ -141,6 +142,7 @@ speakers = ["Kitchen"]         # set by `airpipe use`
 [audio]
 latency = "balanced"           # "low-latency", "balanced" or "robust"
 idle_timeout_secs = 30         # free the speakers after this much silence
+                               # (0 keeps them connected)
 
 [volume]
 follow_system = true           # volume keys and slider control the speakers
@@ -241,7 +243,13 @@ cause.
 **The beginning of short sounds is cut**
 
 The first ~0.5–1 s after a silence is lost while the speaker wakes up.
-Increase `idle_timeout_secs` to keep the speaker connected longer.
+Increase `idle_timeout_secs` to keep the speaker connected longer, or set
+it to 0 to keep it connected once it has played. That suits a main output:
+no reconnection after a pause, and on some speakers (Devialet) no volume
+reset either. The speaker then stays awake, airpipe keeps sending silence
+(about 1.5 Mbit/s of Wi-Fi per speaker, and a little battery), and another
+device can still take it over at any time. After a takeover or a dropout
+in silence, airpipe reconnects on the next sound.
 
 **"requires pairing first"**
 
