@@ -264,10 +264,16 @@ cushion, the buffer skips ahead so latency stays bounded.
 * A session sends the volume during setup, then only when it changes
   (`SessionHandle::set_volume`). It never re-sends on a timer. airpipe
   0.2.1 re-sent it 0.5 s and 2.5 s after the first sound (0.01 dB lower,
-  then ours), to fix a Devialet playing at its own level after standby,
-  which was never confirmed. On a Devialet Phantom, 3 of about 1000
-  sessions hung the speaker's AirPlay receiver at one of those re-sends,
-  until it was power-cycled.
+  then ours). On a Devialet Phantom, 3 of about 1000 sessions hung the
+  speaker's AirPlay receiver at one of those re-sends, until it was
+  power-cycled.
+* The re-send was meant for a real problem, measured later with the
+  Phantom's own control API (`/ipcontrol/v1/.../soundControl/volume`).
+  When airpipe releases the speaker, it drops its AirPlay source. On
+  reconnect, the new source starts at the speaker's own level (35 instead
+  of 50) and ignores the volume sent during setup. One real change once
+  sound plays is applied at once. airpipe does not re-send; to avoid the
+  reset after pauses, `idle_timeout_secs = 0` keeps the speaker connected.
 
 ### Latency reporting
 

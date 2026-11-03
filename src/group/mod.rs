@@ -7,7 +7,7 @@
 //!
 //! ```text
 //!   idle ──audio starts──▶ connecting ──ok──▶ streaming ──idle timeout──▶ idle
-//!                              │                  │  │
+//!                              │                  │  │       (none if 0)
 //!                              └──error──▶ waiting (retry with backoff)
 //!                                                    │
 //!         speaker ended the session (another device took over)
@@ -17,7 +17,9 @@
 //!
 //! Speakers are only held while audible audio flows, so they stay free for
 //! other senders (phones, other computers) the rest of the time, and airpipe
-//! never takes a speaker back from another device mid-playback.
+//! never takes a speaker back from another device mid-playback. With
+//! `idle_timeout_secs = 0` a connected speaker is kept through silence (a
+//! main output: no reconnection after each pause); takeovers work the same.
 //!
 //! One exception: a speaker that ends a session soon after the computer woke
 //! up from a sleep during that session most likely gave up on us while the
@@ -62,6 +64,10 @@ const RETRY_BACKOFF: [u64; 5] = [2, 5, 10, 30, 60];
 /// most likely gave up on it during the sleep (see `lost_in_sleep`).
 /// Observed on a Devialet Phantom: the reset came 6.6 s after waking.
 const AFTER_WAKE: Duration = Duration::from_secs(30);
+/// When speakers are kept connected (`idle_timeout_secs = 0`): how long after
+/// the last sound a failed speaker is still retried, or a taken-over one
+/// still waited for, before it goes idle until the next sound.
+const RECENT_AUDIO: Duration = Duration::from_secs(30);
 /// How often connection management runs.
 const TICK: Duration = Duration::from_millis(250);
 /// How often playback progress is sent to speakers.
@@ -708,21 +714,21 @@ impl Group {
             self.last_audible_packets = packets;
             self.last_audio_at = Some(Instant::now());
         }
-        let audio_flowing = self.last_audio_at.is_some_and(|t| t.elapsed() < self.gc.config.idle_timeout());
+        let idle_timeout = self.gc.config.idle_timeout();
+        let audio_flowing = self.last_audio_at.is_some_and(|t| t.elapsed() < idle_timeout.unwrap_or(RECENT_AUDIO));
         let now = Instant::now();
 
         for i in 0..self.members.len() {
-            match self.members[i].state {
-                MemberState::Idle if audio_flowing => self.start_connect(i),
-                MemberState::Waiting { until } if audio_flowing && now >= until => self.start_connect(i),
-                MemberState::Waiting { .. } | MemberState::Yielded if !audio_flowing => self.members[i].go_idle(),
-                MemberState::Streaming if !audio_flowing => {
+            match step(self.members[i].state, audio_flowing, idle_timeout.is_none(), now) {
+                Step::Connect => self.start_connect(i),
+                Step::ToIdle => self.members[i].go_idle(),
+                Step::Release => {
                     let secs = self.gc.config.audio.idle_timeout_secs;
                     info!("{}: idle for {secs}s, releasing speaker", self.members[i].name);
                     self.release(i);
                     self.members[i].go_idle();
                 }
-                _ => {}
+                Step::Stay => {}
             }
         }
         let streaming = self.members.iter().any(|m| m.state == MemberState::Streaming);
@@ -890,6 +896,27 @@ fn output_latency(latency_ms: u32, jitter_frames: usize, offset_ms: i32) -> Dura
     Duration::from_nanos(frames * 1_000_000_000 / u64::from(SAMPLE_RATE))
 }
 
+/// What `manage_connections` does with one speaker.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Connect,
+    ToIdle,
+    Release,
+    Stay,
+}
+
+/// `audio_flowing`: audible audio within the idle timeout (or
+/// [`RECENT_AUDIO`] when speakers are kept connected).
+fn step(state: MemberState, audio_flowing: bool, keep_connected: bool, now: Instant) -> Step {
+    match state {
+        MemberState::Idle if audio_flowing => Step::Connect,
+        MemberState::Waiting { until } if audio_flowing && now >= until => Step::Connect,
+        MemberState::Waiting { .. } | MemberState::Yielded if !audio_flowing => Step::ToIdle,
+        MemberState::Streaming if !audio_flowing && !keep_connected => Step::Release,
+        _ => Step::Stay,
+    }
+}
+
 /// Whether a session the speaker just closed was lost to the computer
 /// sleeping: the computer went to sleep while the session ran (it woke up
 /// after the session `started`), and woke up shortly before the close. The
@@ -1022,5 +1049,23 @@ mod tests {
         // A negative offset brings a late speaker back on time: nothing to add.
         assert_eq!(output_latency(250, 1024, -100), base);
         assert_eq!(output_latency(1000, 3072, -200), output_latency(1000, 3072, 0));
+    }
+
+    #[test]
+    fn silence_releases_speakers_unless_kept_connected() {
+        let now = Instant::now();
+        assert_eq!(step(MemberState::Streaming, false, false, now), Step::Release);
+        assert_eq!(step(MemberState::Streaming, false, true, now), Step::Stay);
+        assert_eq!(step(MemberState::Streaming, true, false, now), Step::Stay);
+        // Both modes connect on sound and give a taken-over speaker back once it stops.
+        for keep in [false, true] {
+            assert_eq!(step(MemberState::Idle, true, keep, now), Step::Connect);
+            assert_eq!(step(MemberState::Idle, false, keep, now), Step::Stay);
+            assert_eq!(step(MemberState::Yielded, true, keep, now), Step::Stay, "never taken back mid-playback");
+            assert_eq!(step(MemberState::Yielded, false, keep, now), Step::ToIdle);
+            let later = MemberState::Waiting { until: now + Duration::from_secs(5) };
+            assert_eq!(step(later, true, keep, now), Step::Stay);
+            assert_eq!(step(MemberState::Waiting { until: now }, true, keep, now), Step::Connect);
+        }
     }
 }

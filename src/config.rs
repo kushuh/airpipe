@@ -95,7 +95,8 @@ pub struct AudioConfig {
     pub latency: LatencyProfile,
     /// Exact latency in milliseconds; overrides the profile when set.
     pub latency_ms: Option<u32>,
-    /// Release speakers after this many seconds without audio.
+    /// Release speakers after this many seconds without audio; 0 keeps them
+    /// connected.
     pub idle_timeout_secs: u64,
 }
 
@@ -180,7 +181,10 @@ latency = "balanced"
 # speakers do not go that low.
 # latency_ms = 1500
 # Release speakers after this many seconds without audio, so other devices
-# (phones, other computers) can use them.
+# (phones, other computers) can use them. 0 keeps them connected once sound
+# has played: no reconnection delay after a pause, but the speakers stay
+# awake, airpipe keeps streaming silence (Wi-Fi, a little battery), and
+# other devices have to take them over.
 idle_timeout_secs = 30
 
 [volume]
@@ -220,8 +224,10 @@ impl Config {
         }
     }
 
-    pub fn idle_timeout(&self) -> Duration {
-        Duration::from_secs(self.audio.idle_timeout_secs)
+    /// How long without audio before speakers are released; None keeps them
+    /// connected (`idle_timeout_secs = 0`).
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        (self.audio.idle_timeout_secs > 0).then(|| Duration::from_secs(self.audio.idle_timeout_secs))
     }
 
     fn validate(&self) -> Result<()> {
@@ -385,5 +391,12 @@ mod tests {
         assert_eq!(cfg.output.speakers, vec!["Kitchen", "Living Room"]);
         assert!(!cfg.volume.follow_system);
         assert_eq!(cfg.volume.start, StartVolume::Last);
+    }
+
+    #[test]
+    fn zero_idle_timeout_keeps_speakers_connected() {
+        assert_eq!(Config::default().idle_timeout(), Some(Duration::from_secs(30)));
+        let cfg = Config::parse("[audio]\nidle_timeout_secs = 0\n").unwrap();
+        assert_eq!(cfg.idle_timeout(), None);
     }
 }
