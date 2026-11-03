@@ -258,8 +258,12 @@ cushion, the buffer skips ahead so latency stays bounded.
   every desktop, mixer and volume key acts on it. airpipe's output is a
   PipeWire node, so it receives volume changes through its `Props` param,
   with no desktop-specific code.
-* The sink forces PipeWire's software volume to 1.0, so samples are never
-  scaled, and reports the slider position (`cbrt(linear)`) and mute state.
+* The sink pairs every volume update, its own and other clients' (desktops,
+  `wpctl`, WirePlumber restoring the last volume), with software volume 1.0
+  and soft mute off, so samples are never scaled, and reports the slider
+  position (`cbrt(linear)`) and mute state. PipeWire otherwise scales the
+  samples by the slider after any update that sets only `channelVolumes` or
+  `mute`, while `pw-dump` still shows `softVolumes` at 1.0.
   With `follow_system = false` it leaves software volume alone, and the
   slider attenuates digitally like on any device.
 * The slider covers every speaker's full range, linearly in dB: 0% is
