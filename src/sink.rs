@@ -5,10 +5,12 @@
 //! play to it. Design follows PipeWire's own `module-raop-sink`:
 //!
 //! * Format is fixed to S16LE / 44.1 kHz / stereo; PipeWire converts for us.
-//! * Volume and mute set by the user are *not* applied to the samples
-//!   (`softVolumes` forced to 1.0). They are forwarded to the speakers as
-//!   AirPlay volume instead, which keeps full resolution on the wire.
-//!   (With `forward_volume = false`, PipeWire scales samples as usual.)
+//! * Volume and mute set by the user are *not* applied to the samples: every
+//!   volume update, ours or another client's, is paired with `softVolumes` =
+//!   1.0 and `softMute` = false (see `without_soft_volume`). They are
+//!   forwarded to the speakers as AirPlay volume instead, which keeps full
+//!   resolution on the wire. (With `forward_volume = false`, PipeWire scales
+//!   samples as usual.)
 //! * The delay until the speakers play a sample is reported as the input
 //!   port's `Latency` (and as `ProcessLatency`), and updated when it changes,
 //!   so players that do A/V sync (video players, browsers) delay video
@@ -36,6 +38,9 @@ use tracing::{debug, info, warn};
 use crate::proto::rtp::SAMPLE_RATE;
 
 pub use crate::group::volume::SystemVolume;
+
+/// Channels of the output (stereo).
+const CHANNELS: usize = 2;
 
 enum ToSink {
     /// Set the output's volume, as a slider position (0.0..=1.0).
@@ -140,7 +145,7 @@ fn format_param() -> Vec<u8> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::S16LE);
     info.set_rate(SAMPLE_RATE);
-    info.set_channels(2);
+    info.set_channels(CHANNELS as u32);
     let mut pos = [0u32; spa::param::audio::MAX_CHANNELS];
     pos[0] = spa_sys::SPA_AUDIO_CHANNEL_FL;
     pos[1] = spa_sys::SPA_AUDIO_CHANNEL_FR;
@@ -188,49 +193,82 @@ fn latency_params(latency: std::time::Duration) -> [Vec<u8>; 2] {
 struct PropsVolume {
     channel_volumes: Option<Vec<f32>>,
     mute: Option<bool>,
-    /// True if PipeWire would currently scale samples (soft volume != 1).
-    soft_volume_active: bool,
 }
 
-fn parse_props(pod: &Pod) -> Option<PropsVolume> {
-    let (_, Value::Object(obj)) = PodDeserializer::deserialize_any_from(pod.as_bytes()).ok()? else {
-        return None;
-    };
+/// The properties of a Props param.
+fn props_object(pod: &Pod) -> Option<Object> {
+    match PodDeserializer::deserialize_any_from(pod.as_bytes()).ok()? {
+        (_, Value::Object(obj)) => Some(obj),
+        _ => None,
+    }
+}
+
+fn parse_props(props: &Object) -> PropsVolume {
     let mut out = PropsVolume::default();
-    for p in &obj.properties {
+    for p in &props.properties {
         match (p.key, &p.value) {
             (spa_sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) => {
                 out.channel_volumes = Some(v.clone())
             }
             (spa_sys::SPA_PROP_mute, Value::Bool(m)) => out.mute = Some(*m),
-            (spa_sys::SPA_PROP_softVolumes, Value::ValueArray(ValueArray::Float(v))) => {
-                out.soft_volume_active |= v.iter().any(|&x| (x - 1.0).abs() > f32::EPSILON)
-            }
-            (spa_sys::SPA_PROP_softMute, Value::Bool(m)) => out.soft_volume_active |= *m,
             _ => {}
         }
     }
-    Some(out)
+    out
 }
 
-/// Props that neutralize PipeWire's software scaling (the volume goes to the
-/// speakers instead), optionally also setting the user-visible volume.
-fn passthrough_props(channels: usize, channel_volume: Option<f32>) -> Vec<u8> {
-    let mut properties = vec![
-        Property::new(spa_sys::SPA_PROP_softVolumes, Value::ValueArray(ValueArray::Float(vec![1.0; channels]))),
-        Property::new(spa_sys::SPA_PROP_softMute, Value::Bool(false)),
-    ];
-    if let Some(v) = channel_volume {
-        properties.push(Property::new(
-            spa_sys::SPA_PROP_channelVolumes,
-            Value::ValueArray(ValueArray::Float(vec![v; channels])),
-        ));
-    }
+/// A Props update with PipeWire's software volume switched off: `properties`
+/// without any `softVolumes` or `softMute`, plus `softVolumes` = 1.0 and
+/// `softMute` = false.
+///
+/// PipeWire's converter scales the samples by `softVolumes` and `softMute`
+/// once an update has set either of them, and by `channelVolumes` and `mute`
+/// once an update sets one of those without them (`apply_props` in
+/// `spa/plugins/audioconvert/audioconvert.c`; `pw-dump` keeps showing the
+/// old `softVolumes`). So every update that touches the volume must carry
+/// both soft values, as in PipeWire's `module-raop-sink`.
+fn without_soft_volume(mut properties: Vec<Property>) -> Vec<u8> {
+    properties.retain(|p| !matches!(p.key, spa_sys::SPA_PROP_softVolumes | spa_sys::SPA_PROP_softMute));
+    properties
+        .push(Property::new(spa_sys::SPA_PROP_softVolumes, Value::ValueArray(ValueArray::Float(vec![1.0; CHANNELS]))));
+    properties.push(Property::new(spa_sys::SPA_PROP_softMute, Value::Bool(false)));
     serialize(&Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_Props,
         id: spa_sys::SPA_PARAM_Props,
         properties,
     }))
+}
+
+/// Props that set the output's volume (linear amplitude) without scaling the
+/// samples.
+fn level_props(linear: f32) -> Vec<u8> {
+    without_soft_volume(vec![Property::new(
+        spa_sys::SPA_PROP_channelVolumes,
+        Value::ValueArray(ValueArray::Float(vec![linear; CHANNELS])),
+    )])
+}
+
+/// Our reply to a Props update from another client (a desktop, `wpctl`,
+/// WirePlumber restoring the last volume, which only send `channelVolumes`
+/// and `mute`): the same update without software volume, or `None` if it
+/// does not touch the volume.
+///
+/// Set from inside `param_changed`, the reply reaches the converter *instead
+/// of* the original update (the adapter drops an update that a nested one
+/// overtook: `impl_node_set_param` in PipeWire's `audioadapter.c`, 1.0 to
+/// 1.6), and it is not reported back to us. That is why it repeats the rest
+/// of the update.
+fn unscaled_update(props: &Object) -> Option<Vec<u8>> {
+    let touches_volume = props.properties.iter().any(|p| {
+        matches!(
+            p.key,
+            spa_sys::SPA_PROP_channelVolumes
+                | spa_sys::SPA_PROP_mute
+                | spa_sys::SPA_PROP_softVolumes
+                | spa_sys::SPA_PROP_softMute
+        )
+    });
+    touches_volume.then(|| without_soft_volume(props.properties.clone()))
 }
 
 /// Our own serialized params are always valid pods.
@@ -310,17 +348,20 @@ fn run(
             if id != spa_sys::SPA_PARAM_Props {
                 return;
             }
-            let Some(props) = parse_props(param) else { return };
-            if let Some(m) = props.mute {
+            let Some(props) = props_object(param) else { return };
+            if d.forward_volume
+                && let Some(update) = unscaled_update(&props)
+            {
+                set_props(stream, &update); // replaces `param` for the converter
+            }
+            let volume = parse_props(&props);
+            if let Some(m) = volume.mute {
                 d.mute = m;
             }
-            if let Some(vols) = &props.channel_volumes {
-                if !vols.is_empty() {
-                    d.volume = vols.iter().sum::<f32>() / vols.len() as f32;
-                }
-                if d.forward_volume && props.soft_volume_active {
-                    set_props(stream, &passthrough_props(vols.len().max(1), None));
-                }
+            if let Some(vols) = volume.channel_volumes
+                && !vols.is_empty()
+            {
+                d.volume = vols.iter().sum::<f32>() / vols.len() as f32;
             }
             if !d.volume.is_nan() {
                 let _ = d.events.send(SystemVolume { level: slider_level(d.volume), muted: d.mute });
@@ -363,10 +404,7 @@ fn run(
                 // Sliders are cubic; PipeWire stores linear amplitude.
                 let linear = level * level * level;
                 if forward_volume {
-                    // Volume and "no software scaling" in one update, or the
-                    // samples would be attenuated as well as the speakers
-                    // (like module-raop-sink, which always pairs them).
-                    set_props(&stream, &passthrough_props(2, Some(linear)));
+                    set_props(&stream, &level_props(linear));
                 } else if let Err(e) = stream.set_control(spa_sys::SPA_PROP_channelVolumes, &[linear, linear]) {
                     warn!("could not set output volume: {e}");
                 }
@@ -418,26 +456,168 @@ mod tests {
         assert_eq!(slider_level(-1.0), 0.0);
     }
 
-    #[test]
-    fn props_roundtrip() {
-        let bytes = serialize(&Value::Object(Object {
+    fn props(properties: Vec<Property>) -> Vec<u8> {
+        serialize(&Value::Object(Object {
             type_: spa_sys::SPA_TYPE_OBJECT_Props,
             id: spa_sys::SPA_PARAM_Props,
-            properties: vec![
-                Property::new(spa_sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(vec![0.5, 0.25]))),
-                Property::new(spa_sys::SPA_PROP_mute, Value::Bool(true)),
-                Property::new(spa_sys::SPA_PROP_softVolumes, Value::ValueArray(ValueArray::Float(vec![0.5, 0.25]))),
-            ],
-        }));
-        let parsed = parse_props(Pod::from_bytes(&bytes).unwrap()).unwrap();
-        assert_eq!(parsed.channel_volumes, Some(vec![0.5, 0.25]));
-        assert_eq!(parsed.mute, Some(true));
-        assert!(parsed.soft_volume_active);
+            properties,
+        }))
+    }
 
-        let pass = parse_props(Pod::from_bytes(&passthrough_props(2, None)).unwrap()).unwrap();
-        assert!(!pass.soft_volume_active);
-        let set = parse_props(Pod::from_bytes(&passthrough_props(2, Some(0.125))).unwrap()).unwrap();
-        assert!(!set.soft_volume_active, "setting a volume never enables software scaling");
-        assert_eq!(set.channel_volumes, Some(vec![0.125, 0.125]));
+    fn parse(bytes: &[u8]) -> Object {
+        props_object(Pod::from_bytes(bytes).unwrap()).unwrap()
+    }
+
+    fn volumes(v: f32) -> Value {
+        Value::ValueArray(ValueArray::Float(vec![v; CHANNELS]))
+    }
+
+    fn prop(key: u32, value: Value) -> Property {
+        Property::new(key, value)
+    }
+
+    #[test]
+    fn props_roundtrip() {
+        let bytes = props(vec![
+            prop(spa_sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(vec![0.5, 0.25]))),
+            prop(spa_sys::SPA_PROP_mute, Value::Bool(true)),
+            prop(spa_sys::SPA_PROP_softVolumes, volumes(0.5)),
+        ]);
+        let parsed = parse_props(&parse(&bytes));
+        assert_eq!(parsed, PropsVolume { channel_volumes: Some(vec![0.5, 0.25]), mute: Some(true) });
+
+        let set = parse(&level_props(0.125));
+        assert_eq!(parse_props(&set).channel_volumes, Some(vec![0.125, 0.125]));
+        assert!(set.properties.contains(&prop(spa_sys::SPA_PROP_softVolumes, volumes(1.0))));
+        assert!(set.properties.contains(&prop(spa_sys::SPA_PROP_softMute, Value::Bool(false))));
+    }
+
+    #[test]
+    fn unscaled_update_keeps_the_update_without_soft_volume() {
+        // What WirePlumber sends to restore the last volume of an output.
+        let restore = vec![
+            prop(spa_sys::SPA_PROP_channelVolumes, volumes(0.3)),
+            prop(spa_sys::SPA_PROP_mute, Value::Bool(false)),
+            prop(spa_sys::SPA_PROP_volume, Value::Float(1.0)),
+        ];
+        let reply = unscaled_update(&parse(&props(restore.clone()))).unwrap();
+        let mut expected = restore;
+        expected.push(prop(spa_sys::SPA_PROP_softVolumes, volumes(1.0)));
+        expected.push(prop(spa_sys::SPA_PROP_softMute, Value::Bool(false)));
+        assert_eq!(parse(&reply).properties, expected);
+
+        // Soft values from someone else are replaced, not repeated.
+        let soft = props(vec![
+            prop(spa_sys::SPA_PROP_softVolumes, volumes(0.5)),
+            prop(spa_sys::SPA_PROP_softMute, Value::Bool(true)),
+        ]);
+        let reply = parse(&unscaled_update(&parse(&soft)).unwrap());
+        assert_eq!(
+            reply.properties,
+            vec![
+                prop(spa_sys::SPA_PROP_softVolumes, volumes(1.0)),
+                prop(spa_sys::SPA_PROP_softMute, Value::Bool(false))
+            ]
+        );
+
+        // Updates that leave the volume alone need no reply.
+        let master = props(vec![prop(spa_sys::SPA_PROP_volume, Value::Float(1.0))]);
+        assert!(unscaled_update(&parse(&master)).is_none());
+    }
+
+    /// PipeWire's converter, reduced to the gain it applies to the samples
+    /// (`apply_props` and `set_volume` in
+    /// `spa/plugins/audioconvert/audioconvert.c`).
+    struct Converter {
+        channel: (f32, bool),
+        soft: (f32, bool),
+        use_soft: bool,
+    }
+
+    impl Converter {
+        fn new() -> Self {
+            Self { channel: (1.0, false), soft: (1.0, false), use_soft: false }
+        }
+
+        fn apply(&mut self, update: &[u8]) {
+            let (mut soft, mut channel) = (false, false);
+            for p in parse(update).properties {
+                match (p.key, p.value) {
+                    (spa_sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) => {
+                        (self.channel.0, channel) = (v[0], true)
+                    }
+                    (spa_sys::SPA_PROP_mute, Value::Bool(m)) => (self.channel.1, channel) = (m, true),
+                    (spa_sys::SPA_PROP_softVolumes, Value::ValueArray(ValueArray::Float(v))) => {
+                        (self.soft.0, soft) = (v[0], true)
+                    }
+                    (spa_sys::SPA_PROP_softMute, Value::Bool(m)) => (self.soft.1, soft) = (m, true),
+                    _ => {}
+                }
+            }
+            if soft {
+                self.use_soft = true;
+            } else if channel {
+                self.use_soft = false;
+            }
+        }
+
+        fn gain(&self) -> f32 {
+            let (volume, mute) = if self.use_soft { self.soft } else { self.channel };
+            if mute { 0.0 } else { volume }
+        }
+    }
+
+    #[test]
+    fn samples_are_never_scaled_whatever_the_order_of_volume_changes() {
+        // (description, sent by airpipe itself, update)
+        let events = [
+            ("airpipe sets 7%", true, level_props(0.07f32.powi(3))),
+            (
+                "WirePlumber restores 7%",
+                false,
+                props(vec![
+                    prop(spa_sys::SPA_PROP_channelVolumes, volumes(0.07f32.powi(3))),
+                    prop(spa_sys::SPA_PROP_mute, Value::Bool(false)),
+                    prop(spa_sys::SPA_PROP_volume, Value::Float(1.0)),
+                ]),
+            ),
+            ("desktop sets 40%", false, props(vec![prop(spa_sys::SPA_PROP_channelVolumes, volumes(0.064))])),
+            ("desktop mutes", false, props(vec![prop(spa_sys::SPA_PROP_mute, Value::Bool(true))])),
+            ("desktop unmutes", false, props(vec![prop(spa_sys::SPA_PROP_mute, Value::Bool(false))])),
+            (
+                "another client sets soft volume",
+                false,
+                props(vec![
+                    prop(spa_sys::SPA_PROP_softVolumes, volumes(0.5)),
+                    prop(spa_sys::SPA_PROP_softMute, Value::Bool(true)),
+                ]),
+            ),
+        ];
+
+        // The bug this guards against: a desktop update alone made the
+        // converter scale the samples by the slider.
+        let mut plain = Converter::new();
+        plain.apply(&events[0].2);
+        plain.apply(&events[2].2);
+        assert!((plain.gain() - 0.064).abs() < 1e-6);
+
+        for a in &events {
+            for b in &events {
+                for c in &events {
+                    // `sink` has airpipe in front; `plain` gets every update as sent.
+                    let (mut sink, mut plain) = (Converter::new(), Converter::new());
+                    for (what, ours, update) in [a, b, c] {
+                        match unscaled_update(&parse(update)) {
+                            Some(reply) if !ours => sink.apply(&reply),
+                            _ => sink.apply(update),
+                        }
+                        plain.apply(update);
+                        let order = [a.0, b.0, c.0];
+                        assert_eq!(sink.gain(), 1.0, "samples scaled after {what:?} in {order:?}");
+                        assert_eq!(sink.channel, plain.channel, "volume or mute lost after {what:?} in {order:?}");
+                    }
+                }
+            }
+        }
     }
 }
