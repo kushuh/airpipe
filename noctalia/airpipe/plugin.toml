@@ -1,0 +1,63 @@
+id = "kushuh/airpipe"
+name = "AirPlay (airpipe)"
+version = "0.1.0"
+plugin_api = 43
+author = "kushuh"
+license = "MIT"
+icon = "cast"
+description = "Turn airpipe on and off, choose AirPlay speakers, set the volume and change every airpipe setting"
+tags = ["bar", "panel", "service", "shortcut", "audio", "airplay"]
+dependencies = ["airpipe", "systemctl", "pactl"]
+
+[[setting]]
+key = "binary"
+type = "string"
+label_key = "settings.binary.label"
+description_key = "settings.binary.description"
+default = "airpipe"
+
+[[setting]]
+key = "poll_interval"
+type = "int"
+label_key = "settings.poll_interval.label"
+description_key = "settings.poll_interval.description"
+default = 2
+min = 1
+max = 30
+
+# Runs every airpipe, systemctl and pactl command, and publishes the
+# "snapshot" state that the widget, panel and shortcut render.
+[[service]]
+id = "service"
+entry = "service.luau"
+
+[[widget]]
+id = "widget"
+entry = "widget.luau"
+
+  [widget.actions]
+  left = "panel-toggle kushuh/airpipe:panel"
+  scroll_up = "plugin kushuh/airpipe:service all volume-up"
+  scroll_down = "plugin kushuh/airpipe:service all volume-down"
+
+  [[widget.setting]]
+  key = "show_label"
+  type = "bool"
+  label_key = "settings.show_label.label"
+  description_key = "settings.show_label.description"
+  default = false
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 400
+height = "content"
+max_height = 680
+placement = "attached"
+position = "auto"
+open_near_click = true
+
+# Control Center tile: AirPlay on/off; right-click opens the panel.
+[[shortcut]]
+id = "shortcut"
+entry = "shortcut.luau"
