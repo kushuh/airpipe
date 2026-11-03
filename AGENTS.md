@@ -34,7 +34,11 @@ All four must pass before you finish. Unit tests need no network or audio.
   permissions.
 * Never allocate, lock for long, or block in the audio thread
   (`stream/mod.rs`) or the PipeWire `process` callback (`sink.rs`).
-* airpipe only writes `output.speakers` in `config.toml` (`airpipe use`);
-  both files are only edited through `toml_edit` so user comments survive.
+* airpipe writes `config.toml` only when the user asks (`use`, `add`,
+  `remove`, `config set`/`unset`); both files are only edited through
+  `toml_edit` so user comments survive.
+* The JSON printed by `--json` (`src/api.rs`) is an interface for desktop
+  integrations: add fields freely, but bump `api::VERSION` before renaming
+  or removing one.
 * The control socket (`src/control.rs`) is for the current user only: keep
   it in `$XDG_RUNTIME_DIR`, mode 0600, with the peer uid check.

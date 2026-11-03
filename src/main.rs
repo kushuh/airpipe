@@ -10,13 +10,14 @@ use tokio::sync::mpsc;
 
 use airpipe::airplay::connection::{Connection, NotAnswering, USER_AGENT};
 use airpipe::airplay::session::SessionEvent;
+use airpipe::api;
 use airpipe::config::{self, Config, LatencyProfile};
 use airpipe::control::{self, Reply, Request};
 use airpipe::discovery::{self, Device, feature};
 use airpipe::group::volume::{self, VolumeInputs};
 use airpipe::group::{self, GroupConfig, Pipeline};
 use airpipe::proto::rtp::SAMPLE_RATE;
-use airpipe::store::{DeviceSettings, Store};
+use airpipe::store::{DeviceSettings, NotKnown, Store};
 
 #[derive(Parser)]
 #[command(
@@ -35,7 +36,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// List AirPlay speakers on the network.
-    List,
+    List {
+        /// Print JSON for desktop integrations (see src/api.rs).
+        #[arg(long)]
+        json: bool,
+    },
     /// Show what a speaker reports about itself (GET /info).
     Info { speaker: String },
     /// Pair with a speaker that requires a PIN or password.
@@ -59,7 +64,12 @@ enum Cmd {
     /// Stop using a speaker.
     Remove { speaker: String },
     /// Show the speakers in use, their state and volume.
-    Status,
+    Status {
+        /// Print JSON for desktop integrations; reports `"running": false`
+        /// instead of failing when airpipe is not running.
+        #[arg(long)]
+        json: bool,
+    },
     /// Make one speaker of a group quieter, in dB (e.g. -6), until airpipe
     /// restarts. To keep it, lower its default_volume or max_volume in
     /// devices.toml.
@@ -106,8 +116,36 @@ enum Cmd {
         #[arg(long, default_value = "5", value_parser = parse_percent)]
         volume: f32,
     },
-    /// Show where settings live and the effective configuration.
-    Config,
+    /// Show where settings live and the effective configuration, or change
+    /// one setting.
+    #[command(args_conflicts_with_subcommands = true)]
+    Config {
+        /// Print JSON for desktop integrations (see src/api.rs).
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        change: Option<ConfigCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Change one setting in config.toml (e.g. `audio.latency robust`).
+    /// Takes effect when airpipe restarts.
+    Set { key: String, value: String },
+    /// Remove a setting from config.toml, so its default applies.
+    Unset { key: String },
+    /// Change one speaker's setting in devices.toml (whole numbers):
+    /// max_volume (%, applies at once), default_volume (%, used at the next
+    /// start or when not following the system volume) or latency_offset_ms
+    /// (at the next connection). A speaker never played to is looked up on
+    /// the network first, so it can be capped before its first sound.
+    SetSpeaker {
+        speaker: String,
+        key: String,
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
 }
 
 // A single-threaded runtime is plenty: all async work is light network and
@@ -139,11 +177,12 @@ async fn run_command() -> Result<()> {
     let store = Store::open(dir);
 
     match cli.command {
-        Cmd::List => list(&store).await,
+        Cmd::List { json } => list(&store, json).await,
         Cmd::Info { speaker } => info(&speaker).await,
         Cmd::Pair { speaker, password } => pair(&speaker, password, &store).await,
         Cmd::Unpair { speaker } => unpair(&speaker, &store).await,
-        Cmd::Config => show_config(&config_path, &store),
+        Cmd::Config { json, change: None } => show_config(&config_path, &store, json),
+        Cmd::Config { change: Some(change), .. } => change_config(&config_path, &store, change).await,
         Cmd::Use { speakers } => set_speakers(&config_path, speakers).await,
         Cmd::Add { speaker } => {
             let mut speakers = Config::load(&config_path)?.output.speakers;
@@ -162,7 +201,8 @@ async fn run_command() -> Result<()> {
             }
             set_speakers(&config_path, speakers).await
         }
-        Cmd::Status => request(Request::Status).await,
+        Cmd::Status { json: false } => request(Request::Status).await,
+        Cmd::Status { json: true } => status_json().await,
         Cmd::Gain { speaker, db } => request(Request::Gain { speaker: checked_name(speaker)?, db }).await,
         Cmd::Reload => request(Request::Reload).await,
         Cmd::Stop => request(Request::Stop).await,
@@ -236,6 +276,59 @@ fn print_reply(reply: Reply) -> Result<()> {
     Ok(())
 }
 
+/// `status --json`: "not running" is a state to show, not an error.
+async fn status_json() -> Result<()> {
+    match control::send(&Request::StatusJson).await {
+        Ok(reply) => print_reply(reply),
+        Err(e) if e.is::<control::NotRunning>() => {
+            println!("{}", api::to_json(&api::Status::not_running()));
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `config set`, `unset` and `set-speaker`. Speaker settings are applied
+/// right away; other settings when airpipe restarts.
+async fn change_config(config_path: &Path, store: &Store, change: ConfigCmd) -> Result<()> {
+    let key = match change {
+        ConfigCmd::SetSpeaker { speaker, key, value } => {
+            let speaker = checked_name(speaker)?;
+            match store.set_speaker_setting(&speaker, &key, &value) {
+                Err(e) if e.is::<NotKnown>() => {
+                    // Record it with its model's defaults, then apply the change.
+                    let device = find(&speaker).await?;
+                    store.device_settings(&device)?;
+                    store.set_speaker_setting(&device.name, &key, &value)?;
+                }
+                other => other?,
+            }
+            println!("{speaker}: {key} = {value} (saved in {})", store.path().display());
+            return match control::send(&Request::Reload).await {
+                Ok(reply) => print_reply(reply),
+                Err(e) if e.is::<control::NotRunning>() => Ok(()),
+                Err(e) => Err(e),
+            };
+        }
+        ConfigCmd::Set { key, value } => {
+            config::save_setting(config_path, &key, Some(&value))?;
+            println!("{key} = {value} (saved in {})", config_path.display());
+            key
+        }
+        ConfigCmd::Unset { key } => {
+            config::save_setting(config_path, &key, None)?;
+            println!("{key}: back to its default (saved in {})", config_path.display());
+            key
+        }
+    };
+    // Only a running airpipe needs restarting; the next start reads the file.
+    let running = control::send(&Request::Status).await.is_ok();
+    if running {
+        println!("Restart airpipe to apply {key}: systemctl --user restart airpipe.service");
+    }
+    Ok(())
+}
+
 /// Saves the speaker list, then has the running airpipe switch to it.
 async fn set_speakers(config_path: &Path, speakers: Vec<String>) -> Result<()> {
     let speakers = speakers.into_iter().map(checked_name).collect::<Result<Vec<_>>>()?;
@@ -253,8 +346,20 @@ async fn set_speakers(config_path: &Path, speakers: Vec<String>) -> Result<()> {
 }
 
 /// Read-only: shows settings without creating any file.
-fn show_config(path: &Path, store: &Store) -> Result<()> {
+fn show_config(path: &Path, store: &Store, json: bool) -> Result<()> {
     let cfg = Config::load(path)?;
+    if json {
+        let settings = api::Settings {
+            api: api::VERSION,
+            config_file: path.display().to_string(),
+            devices_file: store.path().display().to_string(),
+            config: &cfg,
+            effective_latency_ms: cfg.latency().0,
+            devices: store.known_speakers()?,
+        };
+        println!("{}", api::to_json(&settings));
+        return Ok(());
+    }
     let exists = |p: &Path| if p.exists() { "" } else { " (not created yet)" };
     println!("Global settings: {}{}", path.display(), exists(path));
     println!("Device memory:   {}{}", store.path().display(), exists(&store.path()));
@@ -307,8 +412,28 @@ async fn probe(device: &Device) -> Result<()> {
     Ok(())
 }
 
-async fn list(store: &Store) -> Result<()> {
+async fn list(store: &Store, json: bool) -> Result<()> {
     let scan = discovery::scan(Duration::from_secs(3)).await?;
+    // A few at a time: a misbehaving host could advertise hundreds.
+    let answers: Vec<_> = futures_util::stream::iter(&scan.devices).map(probe).buffered(16).collect().await;
+    if json {
+        let mut speakers = Vec::new();
+        for (d, answer) in scan.devices.iter().zip(answers) {
+            speakers.push(api::FoundSpeaker {
+                id: d.device_id.clone(),
+                name: d.name.clone(),
+                address: d.address.to_string(),
+                model: format!("{} {}", d.manufacturer, d.model).trim().to_string(),
+                airplay2: d.is_airplay2(),
+                needs_pairing: d.needs_pairing(),
+                paired: d.needs_pairing() && store.device_keys(&d.device_id)?.is_some(),
+                needs_password: d.needs_password(),
+                problem: answer.err().map(|e| format!("{e:#}")),
+            });
+        }
+        println!("{}", api::to_json(&api::Found { api: api::VERSION, speakers, unresponsive: scan.unresponsive }));
+        return Ok(());
+    }
     for name in &scan.unresponsive {
         println!("{name:<24} (advertised, but did not answer; it may be waking up, try again)");
     }
@@ -317,8 +442,6 @@ async fn list(store: &Store) -> Result<()> {
         println!("No AirPlay speakers found. Check that UDP 5353 (mDNS) is allowed from your LAN (see README).");
         return Ok(());
     }
-    // A few at a time: a misbehaving host could advertise hundreds.
-    let answers: Vec<_> = futures_util::stream::iter(&devices).map(probe).buffered(16).collect().await;
     println!("{:<24} {:<22} {:<28} NOTES", "NAME", "ADDRESS", "MODEL");
     for (d, answer) in devices.iter().zip(answers) {
         let problem = answer.err().map(|e| format!("{e:#}"));
@@ -404,6 +527,7 @@ async fn tone(name: &str, seconds: u64, volume: f32, cfg: &Config, store: Store)
         gain_db: 0.0,
         cap: None,
         follow_system: false,
+        hold: None,
     };
     let volume = inputs.airplay_db(None);
 

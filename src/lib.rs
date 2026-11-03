@@ -14,6 +14,7 @@
 //! | [`discovery`] | Finding speakers through Avahi                        | no    |
 //! | [`mpris`]   | Now-playing info and remote control via MPRIS           | no    |
 //! | [`control`] | The control socket for `airpipe status`, `use`, `stop`… | no    |
+//! | [`api`]     | JSON shapes for desktop integrations (`--json`)          | yes   |
 //! | [`config`]  | `config.toml` (global settings)                         | yes*  |
 //! | [`store`]   | `devices.toml` (device memory, keys)                    | no    |
 //! | [`suspend`] | Notices when the computer wakes up from sleep           | no    |
@@ -21,7 +22,8 @@
 //!
 //! "Pure" modules do no I/O and are unit-tested byte for byte.
 //! (*`config` parsing is pure; loading reads the file, `run` creates the
-//! commented template on first use, and `use` edits the speaker list.)
+//! commented template on first use, and `use`, `config set` and `unset` edit
+//! it.)
 //!
 //! # Where to start reading
 //!
@@ -32,6 +34,7 @@
 //! `docs/ARCHITECTURE.md` explains the protocol and threading in prose.
 
 pub mod airplay;
+pub mod api;
 pub mod config;
 pub mod control;
 pub mod crypto;

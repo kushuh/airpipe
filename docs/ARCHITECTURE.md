@@ -77,7 +77,17 @@ user unit `airpipe.service`. The other commands either work alone (`list`,
 line, answered by `ok`/`error` and text. `use`, `add` and `remove` write
 `output.speakers` in `config.toml`, then send `reload`; so the file is the
 single source of truth for the speakers, and works the same whether airpipe
-is running or not.
+is running or not. `config set-speaker` works the same way for
+`devices.toml`; `config set` and `unset` only write `config.toml`, which the
+next start reads. Every read-modify-write of either file, by the running
+airpipe or a command, holds `$XDG_CONFIG_HOME/airpipe/.lock`
+(`store::edit_lock`), so two writers never lose each other's change.
+
+Desktop integrations use `status --json` (the `status-json` request),
+`list --json` and `config --json`. Their shapes are in `api.rs`, versioned
+by `api::VERSION`. `status --json` prints `"running": false` instead of
+failing when airpipe is not running, so a UI can show "off" without parsing
+errors.
 
 `run` first takes an exclusive lock on `$XDG_RUNTIME_DIR/airpipe.lock`. A
 second airpipe exits with status 3, which the unit lists in
@@ -261,6 +271,10 @@ cushion, the buffer skips ahead so latency stays bounded.
   live `airpipe gain` trim applies, and the result is clamped to the
   speaker's `max_volume` and the optional `--max-volume` cap
   (`group::volume::VolumeInputs`).
+* A reload must not make a playing speaker louder at once: raising its
+  `max_volume` while the slider sits above the old cap would otherwise jump
+  it to the slider's level. The old level is held (`hold_after_change`)
+  until the user next changes the volume, or the speaker is released.
 * At start-up, and when speakers are added, the slider is moved to the
   speakers' `default_volume` (the lowest across the group). WirePlumber may
   restore a remembered volume onto the new node right after start-up, so

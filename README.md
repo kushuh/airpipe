@@ -192,6 +192,21 @@ latency_offset_ms = 0       # delay this speaker to line it up with others
 
 After editing, run `airpipe reload`.
 
+### From the command line, scripts and desktop integrations
+
+Both files can also be changed one setting at a time; your comments are
+kept, and invalid values are refused before anything is written:
+
+```sh
+airpipe config set audio.latency robust            # applies at the next restart
+airpipe config unset audio.latency_ms              # back to the default
+airpipe config set-speaker Kitchen max_volume 60   # applies right away
+```
+
+`airpipe status --json`, `airpipe list --json` and `airpipe config --json`
+print the same information as JSON for scripts and desktop shells. Every
+reply carries an `api` version; fields are only added within a version.
+
 ## Volume
 
 Your system volume controls the speakers, on every desktop, with no setup.
