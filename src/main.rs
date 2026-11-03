@@ -82,7 +82,7 @@ enum Cmd {
         /// Exact latency in milliseconds (overrides --latency and config.toml).
         #[arg(long, value_parser = parse_latency_ms)]
         latency_ms: Option<u32>,
-        /// Release the speakers after this many seconds without audio.
+        /// Release the speakers after this many seconds without audio (0: keep them connected).
         #[arg(long)]
         idle_timeout: Option<u64>,
         /// PipeWire node name of the output.
@@ -271,7 +271,10 @@ fn show_config(path: &Path, store: &Store) -> Result<()> {
     };
     println!("speakers         {speakers}");
     println!("latency          {latency_ms} ms ({latency_source})");
-    println!("idle timeout     {} s", cfg.audio.idle_timeout_secs);
+    match cfg.idle_timeout() {
+        Some(t) => println!("idle timeout     {} s", t.as_secs()),
+        None => println!("idle timeout     none (speakers stay connected)"),
+    }
     println!("follow system    {}", cfg.volume.follow_system);
     println!("start volume     {:?}", cfg.volume.start);
     println!("output name      {} (shown on speakers as {:?})", cfg.output.node_name, cfg.network.client_name);
