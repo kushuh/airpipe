@@ -15,6 +15,8 @@ local snapshot = noctalia.state.get(STATE_KEY)
 local expanded = { speakers = {}, add = false, settings = false }
 -- Slider positions while dragging, by slider; sent on release.
 local drafts = {}
+-- Text typed in a field and not saved yet, by field.
+local typed = {}
 
 local function tr(key, args)
     return noctalia.tr(key, args)
@@ -71,6 +73,49 @@ local function settingRow(key, label, control)
     return ui.row({ key = key, align = "center", gap = 12 }, {
         ui.label({ text = label, flexGrow = 1, maxLines = 2 }),
         control,
+    })
+end
+
+-- A text field with a save button next to it; Enter saves too. Typing
+-- alone changes nothing: the save button lights up until the text is saved.
+local function textField(key, saved, width, placeholder, save)
+    saved = tostring(saved or "")
+    local function unsaved(text)
+        return text ~= nil and trim(text) ~= trim(saved)
+    end
+    local function commit(text)
+        typed[key] = nil
+        if unsaved(text) then
+            save(trim(text))
+        end
+        render()
+    end
+    local dirty = unsaved(typed[key])
+    return ui.row({ gap = 4, align = "center" }, {
+        ui.input({
+            key = key,
+            value = saved,
+            width = width,
+            placeholder = placeholder,
+            onChange = function(text)
+                local was = unsaved(typed[key])
+                typed[key] = text
+                -- Re-render only when the save button changes, not per key.
+                if unsaved(text) ~= was then
+                    render()
+                end
+            end,
+            onSubmit = commit,
+        }),
+        ui.button({
+            glyph = "device-floppy",
+            variant = dirty and "primary" or "ghost",
+            enabled = dirty,
+            tooltip = tr("panel.save"),
+            onClick = function()
+                commit(typed[key])
+            end,
+        }),
     })
 end
 
@@ -289,14 +334,9 @@ local function speakerSettings(name)
     return {
         percentSlider(`default-{name}`, tr("speaker.default_volume"), known.default_volume, commit("default_volume")),
         percentSlider(`max-{name}`, tr("speaker.max_volume"), known.max_volume, commit("max_volume")),
-        settingRow(`offset-row-{name}`, tr("speaker.latency_offset"), ui.input({
-            key = `offset-{name}`,
-            value = tostring(known.latency_offset_ms or 0),
-            width = 90,
-            onSubmit = function(text)
-                send("set_speaker", { speaker = name, key = "latency_offset_ms", value = trim(text) })
-            end,
-        })),
+        settingRow(`offset-row-{name}`, tr("speaker.latency_offset"), textField(`offset-{name}`, known.latency_offset_ms or 0, 90, nil, function(value)
+            send("set_speaker", { speaker = name, key = "latency_offset_ms", value = value })
+        end)),
         muted(tr("speaker.latency_offset_hint")),
     }
 end
@@ -451,19 +491,13 @@ local function settingsSection()
             end
         end,
     })))
-    table.insert(items, settingRow("latency-ms", tr("settings.latency_ms"), ui.input({
-        key = "latency-ms-input",
-        value = cfg.audio.latency_ms ~= nil and tostring(cfg.audio.latency_ms) or "",
-        placeholder = tr("settings.latency_ms_placeholder"),
-        width = 90,
-        onSubmit = function(text)
-            if trim(text) == "" then
-                send("unset", { key = "audio.latency_ms" })
-            else
-                setTo("audio.latency_ms")(trim(text))
-            end
-        end,
-    })))
+    table.insert(items, settingRow("latency-ms", tr("settings.latency_ms"), textField("latency-ms-input", cfg.audio.latency_ms, 90, tr("settings.latency_ms_placeholder"), function(value)
+        if value == "" then
+            send("unset", { key = "audio.latency_ms" })
+        else
+            setTo("audio.latency_ms")(value)
+        end
+    end)))
     table.insert(items, muted(tr("settings.latency_hint", { ms = snapshot.config.effective_latency_ms or "?" }), "latency-hint"))
     table.insert(items, settingRow("keep", tr("settings.keep_connected"), ui.toggle({
         checked = idle == 0,
@@ -472,14 +506,7 @@ local function settingsSection()
         end,
     })))
     if idle ~= 0 then
-        table.insert(items, settingRow("idle", tr("settings.idle_timeout"), ui.input({
-            key = "idle-input",
-            value = tostring(idle),
-            width = 90,
-            onSubmit = function(text)
-                setTo("audio.idle_timeout_secs")(trim(text))
-            end,
-        })))
+        table.insert(items, settingRow("idle", tr("settings.idle_timeout"), textField("idle-input", idle, 90, nil, setTo("audio.idle_timeout_secs"))))
     end
     table.insert(items, settingRow("follow", tr("settings.follow_system"), ui.toggle({
         checked = cfg.volume.follow_system == true,
@@ -499,16 +526,11 @@ local function settingsSection()
         checked = cfg.metadata.enabled == true,
         onChange = setTo("metadata.enabled"),
     })))
-    table.insert(items, settingRow("client-name", tr("settings.client_name"), ui.input({
-        key = "client-name-input",
-        value = cfg.network.client_name or "",
-        width = 140,
-        onSubmit = function(text)
-            if trim(text) ~= "" then
-                setTo("network.client_name")(trim(text))
-            end
-        end,
-    })))
+    table.insert(items, settingRow("client-name", tr("settings.client_name"), textField("client-name-input", cfg.network.client_name, 140, nil, function(value)
+        if value ~= "" then
+            setTo("network.client_name")(value)
+        end
+    end)))
     table.insert(items, muted(tr("settings.files", {
         config = snapshot.config.config_file or "",
         devices = snapshot.config.devices_file or "",

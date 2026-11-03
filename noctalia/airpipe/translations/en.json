@@ -44,6 +44,7 @@
   },
   "panel": {
     "refresh": "Refresh",
+    "save": "Save",
     "title": "AirPlay",
     "version": "airpipe {version}"
   },
