@@ -153,17 +153,24 @@ tar -xzf "$TMP/$FILE" -C "$TMP/unpacked"
 grep -q "^id = \"$PLUGIN_ID\"" "$TMP/unpacked/airpipe/plugin.toml" || die "$FILE is not the $PLUGIN_ID plugin"
 
 # Replace the old copy (or a development symlink) in one step.
+UPDATE=0
 if [ -L "$DEST" ]; then
     rm -f "$DEST"
+    UPDATE=1
 elif [ -e "$DEST" ]; then
     mv "$DEST" "$TMP/previous"
+    UPDATE=1
 fi
 mv "$TMP/unpacked/airpipe" "$DEST"
 say "Installed the airpipe plugin in $DEST."
 
 if [ "$ENABLE" = 1 ] && noctalia_running; then
-    # Picks up a changed plugin.toml; scripts reload by themselves.
+    # Picks up a changed plugin.toml.
     noctalia msg config-reload >/dev/null 2>&1 || true
+    # A running plugin keeps its old scripts until it restarts.
+    if [ "$UPDATE" = 1 ]; then
+        noctalia msg plugins disable "$PLUGIN_ID" >/dev/null 2>&1 || true
+    fi
     if noctalia msg plugins enable "$PLUGIN_ID" >/dev/null 2>&1; then
         say "Enabled $PLUGIN_ID in Noctalia."
     else

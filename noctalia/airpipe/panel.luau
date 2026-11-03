@@ -88,8 +88,13 @@ local function percentSlider(key, label, value, commit)
             step = 1,
             value = shown,
             onChange = function(text)
-                drafts[key] = round(text)
-                render()
+                -- The host also reports the value it was just given: only a
+                -- real move re-renders, or each render would trigger the next.
+                local moved = round(text)
+                if moved ~= shown then
+                    drafts[key] = moved
+                    render()
+                end
             end,
             onDragEnd = function()
                 local final = drafts[key]
@@ -236,8 +241,11 @@ local function volumeSection()
             value = shown,
             flexGrow = 1,
             onChange = function(text)
-                drafts.volume = round(text)
-                render()
+                local moved = round(text) -- see percentSlider
+                if moved ~= shown then
+                    drafts.volume = moved
+                    render()
+                end
             end,
             onDragEnd = function()
                 local final = drafts.volume
@@ -247,7 +255,7 @@ local function volumeSection()
                 end
             end,
         }),
-        ui.label({ text = tr("unit.percent", { value = shown }), color = "on_surface_variant", minWidth = 40 }),
+        ui.label({ text = tr("unit.percent", { value = shown }), color = "on_surface_variant", width = 40 }),
     })
 end
 
