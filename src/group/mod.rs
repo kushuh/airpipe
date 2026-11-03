@@ -7,7 +7,7 @@
 //!
 //! ```text
 //!   idle ──audio starts──▶ connecting ──ok──▶ streaming ──idle timeout──▶ idle
-//!                              │                  │  │
+//!                              │                  │  │       (none if 0)
 //!                              └──error──▶ waiting (retry with backoff)
 //!                                                    │
 //!         speaker ended the session (another device took over)
@@ -17,7 +17,15 @@
 //!
 //! Speakers are only held while audible audio flows, so they stay free for
 //! other senders (phones, other computers) the rest of the time, and airpipe
-//! never takes a speaker back from another device mid-playback.
+//! never takes a speaker back from another device mid-playback. With
+//! `idle_timeout_secs = 0` a connected speaker is kept through silence (a
+//! main output: no reconnection after each pause); takeovers work the same.
+//!
+//! One exception: a speaker that ends a session soon after the computer woke
+//! up from a sleep during that session most likely gave up on us while the
+//! computer slept. That is a failure (retry with backoff), but the retries
+//! give way to another device the speaker reports playing, in case one took
+//! over during the sleep (see `Member::on_closed`).
 //!
 //! [`run`] sets everything up, then `Group` reacts to one event at a time;
 //! each `on_*` method handles one event source. Requests from `airpipe
@@ -35,7 +43,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use crate::airplay::events::RemoteCommand;
-use crate::airplay::session::{self, Command, SessionContext, SessionEvent, SessionHandle, SessionId};
+use crate::airplay::session::{self, Command, IfInUse, InUse, SessionContext, SessionEvent, SessionHandle, SessionId};
 use crate::config::{Config, StartVolume};
 use crate::control::{self, Reply, Request};
 use crate::discovery::{self, Device, feature};
@@ -47,10 +55,19 @@ use crate::sink::{Sink, SinkConfig};
 use crate::store::{DeviceSettings, Store};
 use crate::stream::timing::{AllowedPeers, PeerPermit, TimingServer};
 use crate::stream::{self, Engine, EngineConfig, TargetId};
+use crate::suspend;
 use volume::{MIN_DB, MUTED_DB, SystemVolume, VolumeInputs};
 
 /// Seconds to wait before reconnecting, by number of consecutive failures.
 const RETRY_BACKOFF: [u64; 5] = [2, 5, 10, 30, 60];
+/// A speaker that ends a session this soon after the computer wakes up
+/// most likely gave up on it during the sleep (see `lost_in_sleep`).
+/// Observed on a Devialet Phantom: the reset came 6.6 s after waking.
+const AFTER_WAKE: Duration = Duration::from_secs(30);
+/// When speakers are kept connected (`idle_timeout_secs = 0`): how long after
+/// the last sound a failed speaker is still retried, or a taken-over one
+/// still waited for, before it goes idle until the next sound.
+const RECENT_AUDIO: Duration = Duration::from_secs(30);
 /// How often connection management runs.
 const TICK: Duration = Duration::from_millis(250);
 /// How often playback progress is sent to speakers.
@@ -121,7 +138,7 @@ impl Pipeline {
         volume_db: f32,
         events: mpsc::Sender<SessionEvent>,
     ) -> Result<(SessionHandle, PeerPermit)> {
-        connect(&self.peers, &self.ctx, device, keys, volume_db, events).await
+        connect(&self.peers, &self.ctx, device, keys, volume_db, IfInUse::TakeOver, events).await
     }
 }
 
@@ -131,10 +148,11 @@ async fn connect(
     device: Device,
     keys: Option<crate::crypto::pairing::DeviceKeys>,
     volume_db: f32,
+    if_in_use: IfInUse,
     events: mpsc::Sender<SessionEvent>,
 ) -> Result<(SessionHandle, PeerPermit)> {
     let permit = peers.allow(device.address.ip());
-    let session = session::start(device, ctx.clone(), keys, volume_db, events).await?;
+    let session = session::start(device, ctx.clone(), keys, volume_db, if_in_use, events).await?;
     Ok((session, permit))
 }
 
@@ -146,7 +164,8 @@ enum MemberState {
     Waiting {
         until: Instant,
     },
-    /// Another device took the speaker over; wait for the next audio onset.
+    /// Another device took the speaker over; wait until the sound stops,
+    /// then connect on the next sound.
     Yielded,
 }
 
@@ -167,6 +186,9 @@ struct Member {
     /// The current connection attempt; results of older ones are dropped.
     attempt: u64,
     last_error: Option<String>,
+    /// Set when the connection was lost while the computer slept: until the
+    /// sound stops, connection attempts give way to another device.
+    give_way: bool,
 }
 
 impl Member {
@@ -183,11 +205,45 @@ impl Member {
             failures: 0,
             attempt: 0,
             last_error: None,
+            give_way: false,
         }
     }
 
     fn has_session(&self, id: SessionId) -> bool {
         self.session.as_ref().is_some_and(|s| s.id == id)
+    }
+
+    /// The speaker ended our session (already released). Usually another
+    /// device took it over: wait until the sound stops. If the session was
+    /// lost to the computer sleeping (`lost_in_sleep`), our sound was cut
+    /// off instead: reconnect, unless by then the speaker reports another
+    /// device playing (one may have taken over while the computer slept).
+    fn on_closed(&mut self, lost_in_sleep: bool) {
+        if lost_in_sleep {
+            self.give_way = true;
+            schedule_retry(self, "the connection was lost while the computer was asleep".into());
+        } else {
+            info!("{}: the speaker ended the session (probably another device took over)", self.name);
+            self.state = MemberState::Yielded;
+        }
+    }
+
+    /// A connection attempt failed.
+    fn on_connect_failed(&mut self, e: anyhow::Error) {
+        if e.is::<InUse>() {
+            info!("{}: another device is playing to it; waiting until the sound stops", self.name);
+            self.give_way = false;
+            self.state = MemberState::Yielded;
+        } else {
+            schedule_retry(self, format!("{e:#}"));
+        }
+    }
+
+    /// The sound stopped (or the speaker is released): the next sound
+    /// connects afresh.
+    fn go_idle(&mut self) {
+        self.state = MemberState::Idle;
+        self.give_way = false;
     }
 }
 
@@ -308,6 +364,7 @@ pub async fn run(gc: GroupConfig, store: Store, control: control::Server) -> Res
         streaming_tx,
         system: None,
         start_level: None,
+        suspend: suspend::Watch::default(),
         last_audible_packets: 0,
         last_audio_at: None,
         now_playing: NowPlaying::default(),
@@ -378,6 +435,8 @@ struct Group {
     /// Slider level set by `apply_start_volume`, and when; re-asserted
     /// during the start window.
     start_level: Option<(f32, Instant)>,
+    /// Tells a speaker giving up on us during a sleep from a takeover.
+    suspend: suspend::Watch,
     last_audible_packets: u64,
     last_audio_at: Option<Instant>,
     now_playing: NowPlaying,
@@ -464,9 +523,12 @@ impl Group {
                     debug!("too many remote commands, dropping one");
                 }
             }
-            SessionEvent::TakenOver { .. } => {
+            SessionEvent::SpeakerClosed { .. } => {
+                let started = self.members[i].session.as_ref().map_or_else(Instant::now, |s| s.started);
                 self.release(i);
-                self.members[i].state = MemberState::Yielded;
+                self.suspend.look();
+                let lost = lost_in_sleep(started, self.suspend.woke_at(), Instant::now());
+                self.members[i].on_closed(lost);
             }
             SessionEvent::Failed { error, .. } => {
                 self.release(i);
@@ -486,7 +548,7 @@ impl Group {
         };
         let (settings, session, permit) = match c.result {
             Ok(ok) => ok,
-            Err(e) => return schedule_retry(&mut self.members[i], format!("{e:#}")),
+            Err(e) => return self.members[i].on_connect_failed(e),
         };
         // devices.toml may have been reloaded while connecting: use it as it is now.
         let settings = self.store.device_settings(&session.device).unwrap_or(settings);
@@ -506,6 +568,7 @@ impl Group {
         m.state = MemberState::Streaming;
         m.failures = 0;
         m.last_error = None;
+        m.give_way = false;
         // The system volume may have changed while connecting.
         self.send_volume(&self.members[i]);
     }
@@ -645,28 +708,27 @@ impl Group {
 
     /// Connects speakers while audible audio flows, releases them when it stops.
     fn manage_connections(&mut self) {
+        self.suspend.look();
         let packets = self.pipeline.engine.audible_packets();
         if packets != self.last_audible_packets {
             self.last_audible_packets = packets;
             self.last_audio_at = Some(Instant::now());
         }
-        let audio_flowing = self.last_audio_at.is_some_and(|t| t.elapsed() < self.gc.config.idle_timeout());
+        let idle_timeout = self.gc.config.idle_timeout();
+        let audio_flowing = self.last_audio_at.is_some_and(|t| t.elapsed() < idle_timeout.unwrap_or(RECENT_AUDIO));
         let now = Instant::now();
 
         for i in 0..self.members.len() {
-            match self.members[i].state {
-                MemberState::Idle if audio_flowing => self.start_connect(i),
-                MemberState::Waiting { until } if audio_flowing && now >= until => self.start_connect(i),
-                MemberState::Waiting { .. } | MemberState::Yielded if !audio_flowing => {
-                    self.members[i].state = MemberState::Idle;
-                }
-                MemberState::Streaming if !audio_flowing => {
+            match step(self.members[i].state, audio_flowing, idle_timeout.is_none(), now) {
+                Step::Connect => self.start_connect(i),
+                Step::ToIdle => self.members[i].go_idle(),
+                Step::Release => {
                     let secs = self.gc.config.audio.idle_timeout_secs;
                     info!("{}: idle for {secs}s, releasing speaker", self.members[i].name);
                     self.release(i);
-                    self.members[i].state = MemberState::Idle;
+                    self.members[i].go_idle();
                 }
-                _ => {}
+                Step::Stay => {}
             }
         }
         let streaming = self.members.iter().any(|m| m.state == MemberState::Streaming);
@@ -708,6 +770,7 @@ impl Group {
         info!("{}: connecting", m.name);
         let name = m.name.clone();
         let known = m.device.clone();
+        let if_in_use = if m.give_way { IfInUse::GiveWay } else { IfInUse::TakeOver };
         let (peers, ctx) = (self.pipeline.peers.clone(), self.pipeline.ctx.clone());
         let (store, events, results) = (self.store.clone(), self.session_tx.clone(), self.connected_tx.clone());
         tokio::spawn(async move {
@@ -720,7 +783,7 @@ impl Group {
                 let settings = store.device_settings(&device)?;
                 let volume = VolumeInputs { settings, ..inputs }.airplay_db(system);
                 let keys = store.keys_for(&device)?;
-                let (session, permit) = connect(&peers, &ctx, device, keys, volume, events).await?;
+                let (session, permit) = connect(&peers, &ctx, device, keys, volume, if_in_use, events).await?;
                 Ok((settings, session, permit))
             }
             .await;
@@ -833,6 +896,36 @@ fn output_latency(latency_ms: u32, jitter_frames: usize, offset_ms: i32) -> Dura
     Duration::from_nanos(frames * 1_000_000_000 / u64::from(SAMPLE_RATE))
 }
 
+/// What `manage_connections` does with one speaker.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Connect,
+    ToIdle,
+    Release,
+    Stay,
+}
+
+/// `audio_flowing`: audible audio within the idle timeout (or
+/// [`RECENT_AUDIO`] when speakers are kept connected).
+fn step(state: MemberState, audio_flowing: bool, keep_connected: bool, now: Instant) -> Step {
+    match state {
+        MemberState::Idle if audio_flowing => Step::Connect,
+        MemberState::Waiting { until } if audio_flowing && now >= until => Step::Connect,
+        MemberState::Waiting { .. } | MemberState::Yielded if !audio_flowing => Step::ToIdle,
+        MemberState::Streaming if !audio_flowing && !keep_connected => Step::Release,
+        _ => Step::Stay,
+    }
+}
+
+/// Whether a session the speaker just closed was lost to the computer
+/// sleeping: the computer went to sleep while the session ran (it woke up
+/// after the session `started`), and woke up shortly before the close. The
+/// speaker gives up on a sleeping sender, but that only shows once the
+/// computer is awake: the first request gets a reset instead of an answer.
+fn lost_in_sleep(started: Instant, woke_at: Option<Instant>, now: Instant) -> bool {
+    woke_at.is_some_and(|woke| woke > started && now.saturating_duration_since(woke) <= AFTER_WAKE)
+}
+
 fn schedule_retry(m: &mut Member, error: String) {
     let delay = RETRY_BACKOFF[m.failures.min(RETRY_BACKOFF.len() - 1)];
     warn!("{}: {error}; retrying in {delay}s", m.name);
@@ -884,6 +977,69 @@ fn send_progress(s: &SessionHandle, np: &NowPlaying, engine: &Engine) {
 mod tests {
     use super::*;
 
+    fn streaming(name: &str) -> Member {
+        Member { state: MemberState::Streaming, ..Member::new(name.into()) }
+    }
+
+    #[test]
+    fn only_a_close_soon_after_waking_from_a_sleep_during_the_session_is_a_loss() {
+        let started = Instant::now();
+        let at = |s: u64| started + Duration::from_secs(s);
+        // Never slept.
+        assert!(!lost_in_sleep(started, None, at(60)));
+        // Slept during the session, closed 6.6 s after waking (2026-11-03).
+        let woke = at(20);
+        assert!(lost_in_sleep(started, Some(woke), woke + Duration::from_millis(6600)));
+        assert!(lost_in_sleep(started, Some(woke), woke + AFTER_WAKE));
+        // Long after waking: a takeover like any other.
+        assert!(!lost_in_sleep(started, Some(woke), woke + AFTER_WAKE + Duration::from_secs(1)));
+        // The session started after the computer woke up: it did not sleep.
+        assert!(!lost_in_sleep(at(30), Some(woke), at(35)));
+    }
+
+    #[test]
+    fn a_speaker_ending_the_session_was_taken_over() {
+        let mut m = streaming("Bureau");
+        m.on_closed(false);
+        assert_eq!(m.state, MemberState::Yielded, "never taken back mid-playback");
+        assert!(!m.give_way);
+        assert_eq!(m.failures, 0);
+    }
+
+    #[test]
+    fn a_session_lost_during_sleep_is_retried_giving_way() {
+        let mut m = streaming("Bureau");
+        m.on_closed(true);
+        let MemberState::Waiting { until } = m.state else { panic!("{:?}", m.state) };
+        let delay = until.saturating_duration_since(Instant::now());
+        assert!(delay > Duration::from_secs(1) && delay <= Duration::from_secs(RETRY_BACKOFF[0]), "{delay:?}");
+        assert!(m.give_way);
+        assert!(m.last_error.as_deref().is_some_and(|e| e.contains("asleep")));
+
+        // The speaker cannot be reached yet (network still coming back):
+        // keep retrying, still giving way.
+        m.state = MemberState::Connecting;
+        m.on_connect_failed(anyhow::anyhow!("could not connect to 192.168.1.17:7000"));
+        assert!(matches!(m.state, MemberState::Waiting { .. }));
+        assert!(m.give_way);
+        assert_eq!(m.failures, 2);
+
+        // Another device took over while the computer slept: leave it be.
+        m.state = MemberState::Connecting;
+        m.on_connect_failed(InUse.into());
+        assert_eq!(m.state, MemberState::Yielded);
+        assert!(!m.give_way);
+    }
+
+    #[test]
+    fn giving_way_ends_when_the_sound_stops() {
+        let mut m = streaming("Bureau");
+        m.on_closed(true);
+        m.go_idle();
+        assert_eq!(m.state, MemberState::Idle);
+        assert!(!m.give_way, "the next sound connects as usual");
+    }
+
     #[test]
     fn output_latency_follows_the_speaker_offset() {
         // 250 ms plus a 1024-frame cushion (23.2 ms).
@@ -893,5 +1049,23 @@ mod tests {
         // A negative offset brings a late speaker back on time: nothing to add.
         assert_eq!(output_latency(250, 1024, -100), base);
         assert_eq!(output_latency(1000, 3072, -200), output_latency(1000, 3072, 0));
+    }
+
+    #[test]
+    fn silence_releases_speakers_unless_kept_connected() {
+        let now = Instant::now();
+        assert_eq!(step(MemberState::Streaming, false, false, now), Step::Release);
+        assert_eq!(step(MemberState::Streaming, false, true, now), Step::Stay);
+        assert_eq!(step(MemberState::Streaming, true, false, now), Step::Stay);
+        // Both modes connect on sound and give a taken-over speaker back once it stops.
+        for keep in [false, true] {
+            assert_eq!(step(MemberState::Idle, true, keep, now), Step::Connect);
+            assert_eq!(step(MemberState::Idle, false, keep, now), Step::Stay);
+            assert_eq!(step(MemberState::Yielded, true, keep, now), Step::Stay, "never taken back mid-playback");
+            assert_eq!(step(MemberState::Yielded, false, keep, now), Step::ToIdle);
+            let later = MemberState::Waiting { until: now + Duration::from_secs(5) };
+            assert_eq!(step(later, true, keep, now), Step::Stay);
+            assert_eq!(step(MemberState::Waiting { until: now }, true, keep, now), Step::Connect);
+        }
     }
 }
