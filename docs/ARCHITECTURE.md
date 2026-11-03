@@ -57,6 +57,7 @@ It is written for reviewers and contributors.
 | `group/mod.rs`        | Group lifecycle, retries, metadata fan-out                             | yes  |
 | `group/volume.rs`     | Volume rules: slider → AirPlay dB, ceilings, start level               | no   |
 | `random.rs`           | The single source of randomness (keys, nonces, IDs), from the OS        | yes  |
+| `suspend.rs`          | Notices when the computer wakes up (`/proc/uptime` against `Instant`)  | yes  |
 | `config.rs`           | Global settings (`config.toml`), defaults, validation                  | no*  |
 | `store.rs`            | Device memory (`devices.toml`): identity, per-speaker settings, keys   | yes  |
 | `control.rs`          | Control socket (`status`, `reload`, `gain`, `stop`), single instance   | yes  |
@@ -162,6 +163,17 @@ After setup:
   `TEARDOWN` and stop, so no code path can leave a session running.
 * While connecting or streaming, a speaker holds a `PeerPermit` that lets
   it use our timing port; the permit is revoked when it is dropped.
+* When the speaker closes the connection, another device has usually taken
+  it over, and airpipe waits until its own sound stops before connecting
+  again. A speaker also gives up on a sender that went to sleep, but that
+  only shows after waking up, when the first request is reset. So when the
+  computer slept during the session and woke up less than 30 s before the
+  close (`suspend.rs`, `group::lost_in_sleep`), the close is retried like a
+  failure instead, and the retries give way (`session::IfInUse::GiveWay`)
+  if `GET /info` says another device is playing, in case a phone took over
+  during the sleep. A Devialet Phantom shows that only through
+  `statusFlags` bit 11 (remote-control relay, set while an iPhone plays);
+  other speakers may set bit 17 (session active).
 
 ### Pairing (`crypto/pairing.rs`, `crypto/srp.rs`)
 

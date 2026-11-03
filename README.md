@@ -29,7 +29,10 @@ terminal or in the background.
   run ahead of the sound).
 * **Plays nicely with others:** airpipe only uses a speaker while sound is
   playing, so your phone or other computers can use it the rest of the time
-  (unless you keep it connected with `idle_timeout_secs = 0`).
+  (unless you keep it connected with `idle_timeout_secs = 0`). It never
+  takes a speaker back from another device mid-playback, and after the
+  computer wakes from sleep it reconnects by itself unless another device
+  is playing.
 * **One-way only:** airpipe only *sends* sound. It never accepts audio or
   video from the network, and never appears as an AirPlay receiver.
 

@@ -15,7 +15,7 @@
 //! After that the session is an actor: it serves volume/metadata commands,
 //! keeps the connection alive with `POST /feedback`, and tears down on request.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use plist::{Dictionary, Value};
@@ -93,9 +93,11 @@ pub type SessionId = u64;
 /// ends because its handle was dropped sends nothing: its owner knows.
 #[derive(Debug)]
 pub enum SessionEvent {
-    /// The speaker closed the session, usually because another device took
-    /// it over. Not an error: do not reconnect right away.
-    TakenOver {
+    /// The speaker closed the connection. Usually another device took the
+    /// speaker over, and the owner should not reconnect right away; but a
+    /// speaker also gives up on a sender that went to sleep, and that only
+    /// shows once it wakes up (see [`crate::suspend`]).
+    SpeakerClosed {
         session: SessionId,
     },
     Failed {
@@ -112,9 +114,32 @@ impl SessionEvent {
     /// The session the event comes from.
     pub fn session(&self) -> SessionId {
         match self {
-            Self::TakenOver { session } | Self::Failed { session, .. } | Self::Remote { session, .. } => *session,
+            Self::SpeakerClosed { session } | Self::Failed { session, .. } | Self::Remote { session, .. } => *session,
         }
     }
+}
+
+/// What [`start`] does when the speaker reports that another device is
+/// playing to it (`statusFlags` in `GET /info`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfInUse {
+    /// Start anyway: the speaker decides, and most let the new sender in.
+    TakeOver,
+    /// Fail with [`InUse`], before pairing.
+    GiveWay,
+}
+
+/// The speaker reports that another device is playing to it, and the caller
+/// asked [`start`] to give way.
+#[derive(Debug, thiserror::Error)]
+#[error("another device is playing to it")]
+pub struct InUse;
+
+/// Whether `statusFlags` say another device is playing to the speaker. Some
+/// speakers report an active session; a Devialet Phantom only reports
+/// remote-control relay, which an iPhone offers while it plays.
+fn in_use(flags: u64) -> bool {
+    flags & (status::RECEIVER_BUSY | status::REMOTE_CONTROL_RELAY) != 0
 }
 
 /// Ports the speaker gave us in the stream SETUP (on `device.address.ip()`).
@@ -130,6 +155,8 @@ pub struct SessionHandle {
     pub id: SessionId,
     pub device: Device,
     pub ports: StreamPorts,
+    /// When setup completed.
+    pub started: Instant,
     tx: mpsc::Sender<Command>,
     volume: watch::Sender<f32>,
     /// Completes when the session actor has finished (after TEARDOWN).
@@ -210,6 +237,7 @@ pub async fn start(
     ctx: SessionContext,
     keys: Option<DeviceKeys>,
     initial_volume: f32,
+    if_in_use: IfInUse,
     events: mpsc::Sender<SessionEvent>,
 ) -> Result<SessionHandle> {
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -230,6 +258,9 @@ pub async fn start(
     // 1. Status flags.
     let info = conn.info().await?;
     let flags = plist_dict(&info).ok().and_then(|d| uint(&d, "statusFlags")).unwrap_or(device.flags);
+    if if_in_use == IfInUse::GiveWay && in_use(flags) {
+        return Err(InUse.into());
+    }
     if flags & status::RECEIVER_BUSY != 0 {
         warn!("{}: reports busy; it may refuse the stream", device.name);
     }
@@ -338,7 +369,7 @@ pub async fn start(
         drop(event_task); // the session is over; stop listening to the speaker
         let _ = done.send(());
     });
-    Ok(SessionHandle { id, device, ports, tx, volume, finished })
+    Ok(SessionHandle { id, device, ports, started: Instant::now(), tx, volume, finished })
 }
 
 /// Serves one session until its handle is dropped (then sends TEARDOWN) or
@@ -400,8 +431,8 @@ async fn actor(
             return;
         }
         Err(e) if e.downcast_ref::<ClosedBySpeaker>().is_some() => {
-            info!("session {id}: the speaker ended it (probably another device took over)");
-            SessionEvent::TakenOver { session: id }
+            debug!("session {id}: closed by the speaker");
+            SessionEvent::SpeakerClosed { session: id }
         }
         Err(e) => {
             warn!("session {id} failed: {e:#}");
@@ -414,6 +445,15 @@ async fn actor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_device_playing_shows_in_the_status_flags() {
+        // A Devialet Phantom: idle or playing from airpipe, then from an iPhone.
+        assert!(!in_use(0x4));
+        assert!(in_use(0x804));
+        // Speakers that report an active session.
+        assert!(in_use(0x20004));
+    }
 
     #[test]
     fn volume_is_locale_independent() {
