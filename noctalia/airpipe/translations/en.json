@@ -1,0 +1,134 @@
+{
+  "action": {
+    "disable": "Not starting at login",
+    "enable": "Starting at login",
+    "restart": "Restarting airpipe",
+    "scan": "Scanning for speakers",
+    "setting": "Saving the setting",
+    "speaker_setting": "Saving the speaker setting",
+    "speakers": "Changing speakers",
+    "start": "Starting airpipe",
+    "stop": "Stopping airpipe",
+    "volume": "Changing the volume"
+  },
+  "banner": {
+    "restart": "Some settings apply when airpipe restarts.",
+    "restart_now": "Restart now"
+  },
+  "cli": {
+    "daemon_old": "The running airpipe is older than this plugin. Restart it to use the new version.",
+    "error": "airpipe did not answer as expected.",
+    "missing": "airpipe is not installed, or not on the shell's PATH. Install it, or set its path in the plugin settings.",
+    "too_old": "This plugin needs airpipe 0.4 or newer. Update airpipe."
+  },
+  "error": {
+    "action": "{action} failed: {detail}",
+    "not_started": "the command could not be started",
+    "timed_out": "no answer in time"
+  },
+  "found": {
+    "add": "Add",
+    "airplay1": "AirPlay 1 only (not supported)",
+    "needs_pairing": "Needs pairing: run `airpipe pair \"{name}\"` in a terminal",
+    "needs_password": "Password protected",
+    "none": "No other speakers found.",
+    "scan": "Scan for speakers",
+    "scanning": "Scanning…",
+    "title": "Add a speaker",
+    "unresponsive": "{name} is advertised but does not answer (waking up?)"
+  },
+  "latency": {
+    "balanced": "Balanced (~1 s)",
+    "low-latency": "Low latency (~0.5 s)",
+    "robust": "Robust (~2 s)"
+  },
+  "panel": {
+    "refresh": "Refresh",
+    "save": "Save",
+    "title": "AirPlay",
+    "version": "airpipe {version}"
+  },
+  "settings": {
+    "autostart": "Start at login",
+    "binary": {
+      "description": "The airpipe command, or its full path if it is not on the shell's PATH.",
+      "label": "airpipe command"
+    },
+    "client_name": "Name shown on speakers",
+    "files": "Saved in {config} and {devices}",
+    "follow_system": "Follow the system volume",
+    "idle_timeout": "Release speakers after (s) of silence",
+    "keep_connected": "Keep speakers connected",
+    "latency": "Buffering",
+    "latency_hint": "Current delay: {ms} ms. Video players compensate for it.",
+    "latency_ms": "Exact delay (ms)",
+    "latency_ms_placeholder": "preset",
+    "metadata": "Now-playing info and speaker buttons",
+    "poll_interval": {
+      "description": "How often the plugin asks airpipe for its state, in seconds.",
+      "label": "Refresh interval"
+    },
+    "show_label": {
+      "description": "Show the speakers and volume next to the icon.",
+      "label": "Show label"
+    },
+    "start_volume": "Volume at start",
+    "title": "Settings"
+  },
+  "shortcut": {
+    "label": "AirPlay"
+  },
+  "speaker": {
+    "connecting": "Connecting…",
+    "default_volume": "Volume at start",
+    "idle": "Ready: plays when there is sound",
+    "in-use": "In use by another device",
+    "latency_offset": "Sync offset (ms)",
+    "latency_offset_hint": "Delays this speaker to line it up with others (next connection).",
+    "max_volume": "Maximum volume",
+    "muted": "muted",
+    "not_used_yet": "Its settings appear once airpipe has found it on the network.",
+    "off": "airpipe is off",
+    "pending": "Waiting for airpipe",
+    "remove": "Stop using",
+    "retrying": "Not reachable, retrying in {seconds} s",
+    "settings": "Speaker settings",
+    "streaming": "Playing at {volume}"
+  },
+  "speakers": {
+    "none": "No speaker selected. Add one below.",
+    "title": "Speakers"
+  },
+  "start": {
+    "device-default": "Each speaker's start volume",
+    "last": "Last volume"
+  },
+  "state": {
+    "busy": "{action}…",
+    "daemon_old": "Restart airpipe",
+    "error": "airpipe error",
+    "loading": "Loading…",
+    "missing": "airpipe not found",
+    "off": "Off",
+    "playing": "Playing to {speakers}",
+    "problem": "A speaker is not reachable",
+    "ready": "Ready: plays when there is sound",
+    "too_old": "Update airpipe",
+    "unknown": "Loading…"
+  },
+  "unit": {
+    "percent": "{value}%"
+  },
+  "volume": {
+    "fixed": "Each speaker plays at its own start volume (follow the system volume is off).",
+    "mute": "Mute",
+    "unknown": "Waiting for the desktop to report the volume."
+  },
+  "widget": {
+    "tooltip": {
+      "hints": "Click: open · Scroll: volume",
+      "title": "AirPlay"
+    },
+    "volume": "{volume}%"
+  }
+}

@@ -226,6 +226,14 @@ on some speakers. So:
 * For a one-off quiet session: `airpipe stop`, then
   `airpipe run --max-volume 10`.
 
+## Top bar plugin (Noctalia)
+
+If you use the [Noctalia](https://noctalia.dev) shell, an optional plugin
+puts AirPlay in the top bar: on/off, volume, speakers and every airpipe
+setting, in your theme. It has its own releases in this repository; see
+[noctalia/airpipe/README.md](noctalia/airpipe/README.md) to install it.
+airpipe works the same without it.
+
 ## Troubleshooting
 
 **`airpipe list` finds no speakers**

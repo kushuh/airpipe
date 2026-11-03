@@ -203,6 +203,9 @@ cargo metadata --format-version 1 --filter-platform x86_64-unknown-linux-gnu \
 | `packaging/build-dist.sh`             | Builds release artifacts (used by CI)           |
 | `packaging/firewalld/airpipe.xml`     | `/usr/lib/firewalld/services/`                  |
 | `packaging/systemd/airpipe.service`   | `/usr/lib/systemd/user/`                        |
+| `noctalia/airpipe/`                   | Noctalia shell plugin (its own releases, below) |
+| `noctalia/install.sh`                 | Plugin installer, attached to plugin releases   |
+| `noctalia/check.py`                   | Offline checks of the plugin (CI, releases)     |
 
 Package contents are declared in `Cargo.toml` under
 `[package.metadata.deb]` and `[package.metadata.generate-rpm]`; keep both
@@ -229,6 +232,21 @@ sh packaging/install.sh --from-dir dist --dry-run
 
 Binaries are built on Ubuntu 24.04, so they need glibc ≥ 2.39 and
 libpipewire ≥ 1.0 at runtime.
+
+### Releasing the Noctalia plugin
+
+The plugin (`noctalia/airpipe/`) has its own version (in its
+`plugin.toml`) and its own tags, `noctalia-vX.Y.Z`, which `release.yml`
+ignores:
+
+1. Bump `version` in `noctalia/airpipe/plugin.toml`, and the version in the
+   install commands of `noctalia/airpipe/README.md`; commit.
+2. `git tag noctalia-v0.1.0 && git push origin noctalia-v0.1.0`.
+3. `.github/workflows/noctalia-release.yml` checks the tag against
+   `plugin.toml`, runs `noctalia/check.py`, and publishes the plugin
+   tarball, `install-noctalia.sh` (with the version filled in) and
+   `SHA256SUMS`. The release is never marked "latest", so airpipe's own
+   installer keeps finding airpipe's newest release.
 
 ## Pull request checklist
 

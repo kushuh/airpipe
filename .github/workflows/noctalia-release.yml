@@ -1,0 +1,71 @@
+name: Noctalia plugin release
+
+# Push a tag like noctalia-v0.1.0 (matching noctalia/airpipe/plugin.toml's
+# version) to publish the Noctalia plugin. Its own release line, separate
+# from airpipe's (v* tags, release.yml).
+on:
+  push:
+    tags: ['noctalia-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish plugin release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sign build provenance (Sigstore)
+      attestations: write  # store the attestation on GitHub
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check tag matches plugin.toml version
+        id: version
+        run: |
+          version=$(grep -m1 '^version' noctalia/airpipe/plugin.toml | cut -d'"' -f2)
+          test "noctalia-v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != noctalia-v$version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check the plugin files
+        run: python3 -I noctalia/check.py
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir dist
+          tar -C noctalia -czf "dist/airpipe-noctalia-$VERSION.tar.gz" airpipe
+          sed "s/^VERSION=\"@VERSION@\"\$/VERSION=\"$VERSION\"/" noctalia/install.sh > dist/install-noctalia.sh
+          grep -q "^VERSION=\"$VERSION\"\$" dist/install-noctalia.sh
+          chmod 755 dist/install-noctalia.sh
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Build provenance attestation
+        # gh attestation verify <file> --repo kushuh/airpipe
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: Noctalia plugin ${{ steps.version.outputs.version }}
+          files: dist/*
+          # airpipe's installer downloads from releases/latest: a plugin
+          # release must never become "latest".
+          make_latest: false
+          body: |
+            The airpipe plugin for the [Noctalia](https://noctalia.dev) shell: AirPlay in the top bar (on/off, volume, speakers and every airpipe setting).
+
+            Install or update, as your own user:
+
+            ```sh
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/noctalia-v${{ steps.version.outputs.version }}/install-noctalia.sh | sh
+            ```
+
+            Needs airpipe 0.4 or newer and Noctalia 5.4 or newer. See [noctalia/airpipe/README.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/noctalia/airpipe/README.md).

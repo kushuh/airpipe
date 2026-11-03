@@ -130,8 +130,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: shellcheck --shell=sh packaging/install.sh packaging/build-dist.sh
+      - run: shellcheck --shell=sh packaging/install.sh packaging/build-dist.sh noctalia/install.sh
       - run: dash -n packaging/install.sh
+      - run: dash -n noctalia/install.sh
+      - name: Noctalia plugin files
+        run: python3 -I noctalia/check.py
 
   installer:
     name: installer on ${{ matrix.distro }}
