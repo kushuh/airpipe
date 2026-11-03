@@ -16,6 +16,7 @@
 //! | [`control`] | The control socket for `airpipe status`, `use`, `stop`… | no    |
 //! | [`config`]  | `config.toml` (global settings)                         | yes*  |
 //! | [`store`]   | `devices.toml` (device memory, keys)                    | no    |
+//! | [`suspend`] | Notices when the computer wakes up from sleep           | no    |
 //! | [`random`]  | The single source of randomness                         | no    |
 //!
 //! "Pure" modules do no I/O and are unit-tested byte for byte.
@@ -43,3 +44,4 @@ pub mod random;
 pub mod sink;
 pub mod store;
 pub mod stream;
+pub mod suspend;

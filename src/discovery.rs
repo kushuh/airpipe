@@ -44,6 +44,12 @@ pub mod status {
     pub const PIN_REQUIRED: u64 = 1 << 3;
     pub const PASSWORD_REQUIRED: u64 = 1 << 7;
     pub const ONE_TIME_PAIRING_REQUIRED: u64 = 1 << 9;
+    /// "RemoteControlRelay" in openairplay/airplay2-receiver. Observed on a
+    /// Devialet Phantom: set while an iPhone plays to it (0x804), cleared as
+    /// soon as it stops (0x4), never set while airpipe plays.
+    pub const REMOTE_CONTROL_RELAY: u64 = 1 << 11;
+    /// "ReceiverSessionIsActive" in openairplay/airplay2-receiver. A Devialet
+    /// Phantom never sets it, not even while an iPhone plays.
     pub const RECEIVER_BUSY: u64 = 1 << 17;
 }
 
