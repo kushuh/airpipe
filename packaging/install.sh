@@ -399,7 +399,7 @@ case "$PKG" in
     apt) pattern="_${DEB_ARCH}\\.deb\$" ;;
     tar) pattern="-$ARCH-linux\\.tar\\.gz\$" ;;
 esac
-FILE=$(awk '{print $2}' "$TMP/SHA256SUMS" | sed 's/^\*//' | grep -E "$pattern" | head -n1 || true)
+FILE=$(awk '{print $2}' "$TMP/SHA256SUMS" | sed 's/^\*//' | grep -E -- "$pattern" | head -n1 || true)
 [ -n "$FILE" ] || die "this release has no package for $ARCH ($PKG)"
 
 if [ -n "$FROM_DIR" ]; then
